@@ -3,8 +3,26 @@ import httpx
 from datetime import datetime, timezone
 from .base import SourceAdapter, logger, retry_fetch
 
+
 class PumpFunAdapter(SourceAdapter):
-    """Fetches new token launches from Pump.fun API."""
+    """Fetches new token launches from Pump.fun API.
+
+    NOTE: The public Pump.fun frontend API (``frontend-api-v2.pump.fun``) has
+    no documented SLA and returns 503 frequently in production.  This adapter
+    is structurally correct but depends on an unreliable public endpoint.
+
+    Status label: ``enabled-unreliable`` — adapter is registered and attempts
+    fetches, but failures are expected and do not indicate a system bug.
+    Set ``PUMPFUN_API_URL`` to override with a private/paid endpoint.
+    """
+
+    #: Public endpoint is functional but unreliable (no SLA, frequent 503).
+    SUPPORTED = True
+    RELIABILITY_NOTE = (
+        "Public endpoint frontend-api-v2.pump.fun has no SLA and returns 503 "
+        "intermittently. Failures are expected. Set PUMPFUN_API_URL to use a "
+        "private or paid endpoint."
+    )
 
     def __init__(self, api_url: str | None = None, timeout: float = 10.0,
                  fetch_limit: int = 50):

@@ -50,7 +50,45 @@ _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 # ---------------------------------------------------------------------------
 
 
-def validate_startup(settings: Settings) -> list[str]:
+def _source_status_map(settings: Settings, demo_mode: bool) -> dict[str, str]:
+    """Return a mapping of source name → status label.
+
+    Labels:
+      demo-disabled   — live adapter suppressed because --demo mode is active
+      enabled         — adapter will be registered and will attempt fetches
+      unsupported     — adapter code exists but upstream API is non-functional
+      disabled        — no API key / config provided
+    """
+    status: dict[str, str] = {}
+
+    if demo_mode:
+        status["pump.fun"] = "demo-disabled"
+        status["solana_rpc"] = "demo-disabled"
+        status["newsapi"] = "demo-disabled"
+        status["serpapi_trends"] = "demo-disabled"
+    else:
+        # pump.fun — enabled but publicly unreliable
+        status["pump.fun"] = "enabled-unreliable"
+        # solana_rpc — enabled (public RPC, rate-limited but usable)
+        status["solana_rpc"] = "enabled"
+        # newsapi
+        status["newsapi"] = "enabled" if settings.newsapi_key else "disabled (NEWSAPI_KEY not set)"
+        # serpapi_trends — API discontinued regardless of key
+        status["serpapi_trends"] = "unsupported (SerpAPI endpoint discontinued)"
+
+    # Delivery channels
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        status["telegram_delivery"] = "enabled"
+    else:
+        status["telegram_delivery"] = "disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set)"
+
+    if settings.webhook_url:
+        status["webhook_delivery"] = "enabled"
+
+    return status
+
+
+def validate_startup(settings: Settings, demo_mode: bool = False) -> list[str]:
     """Validate settings and system preconditions before startup.
 
     Returns a list of error strings. An empty list means all checks passed.
@@ -89,30 +127,12 @@ def validate_startup(settings: Settings) -> list[str]:
             "Check file permissions."
         )
 
-    # Source availability warnings (not errors — missing keys just disable sources)
-    sources_enabled: list[str] = ["pump.fun (default)"]
-    sources_disabled: list[str] = []
-
-    if settings.newsapi_key:
-        sources_enabled.append("newsapi")
-    else:
-        sources_disabled.append("newsapi (NEWSAPI_KEY not set)")
-
-    if settings.serpapi_key:
-        sources_enabled.append("serpapi_trends")
-    else:
-        sources_disabled.append("serpapi_trends (SERPAPI_KEY not set)")
-
-    if settings.telegram_bot_token and settings.telegram_chat_id:
-        sources_enabled.append("telegram_delivery")
-    else:
-        sources_disabled.append("telegram_delivery (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set)")
-
+    source_status = _source_status_map(settings, demo_mode)
     logger.info(
         "startup_source_check",
         environment=settings.environment,
-        sources_enabled=sources_enabled,
-        sources_disabled=sources_disabled,
+        demo_mode=demo_mode,
+        source_status=source_status,
     )
 
     return errors
@@ -123,8 +143,13 @@ def validate_startup(settings: Settings) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def build_system(settings: Settings) -> tuple:
-    """Build all system components from settings. Returns (pipeline, db)."""
+def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
+    """Build all system components from settings. Returns (pipeline, db).
+
+    When *demo_mode* is True, no live external adapters are registered.
+    Ingestion is a no-op — the pipeline runs only on data injected by
+    ``inject_demo_data()``.  No HTTP calls are made during the cycle.
+    """
     # Database
     db_path = settings.database_path
     os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
@@ -134,50 +159,56 @@ def build_system(settings: Settings) -> tuple:
     # Ingestion
     ingestion = IngestionManager()
 
-    if settings.pumpfun_api_url:
-        ingestion.register_token_adapter(
-            PumpFunAdapter(
-                api_url=settings.pumpfun_api_url,
-                timeout=settings.external_api_timeout_seconds,
-                fetch_limit=settings.pumpfun_fetch_limit,
-            )
-        )
+    if demo_mode:
+        # Demo mode: no live adapters registered → zero external HTTP calls.
+        # All data comes from inject_demo_data() called before run_cycle().
+        logger.info("demo_mode_no_live_adapters")
     else:
+        # Live adapters — register in order of reliability.
+
+        # Pump.fun: public endpoint, no SLA.  Failures are expected.
+        if settings.pumpfun_api_url:
+            ingestion.register_token_adapter(
+                PumpFunAdapter(
+                    api_url=settings.pumpfun_api_url,
+                    timeout=settings.external_api_timeout_seconds,
+                    fetch_limit=settings.pumpfun_fetch_limit,
+                )
+            )
+        else:
+            ingestion.register_token_adapter(
+                PumpFunAdapter(
+                    timeout=settings.external_api_timeout_seconds,
+                    fetch_limit=settings.pumpfun_fetch_limit,
+                )
+            )
+
+        # SolanaRPC — for on-chain enrichment; public endpoint, rate-limited.
         ingestion.register_token_adapter(
-            PumpFunAdapter(
+            SolanaRPCAdapter(
+                rpc_url=settings.solana_rpc_url,
                 timeout=settings.external_api_timeout_seconds,
-                fetch_limit=settings.pumpfun_fetch_limit,
             )
         )
 
-    # SolanaRPC — always register for on-chain enrichment
-    ingestion.register_token_adapter(
-        SolanaRPCAdapter(
-            rpc_url=settings.solana_rpc_url,
-            timeout=settings.external_api_timeout_seconds,
-        )
-    )
-
-    if settings.newsapi_key:
-        ingestion.register_event_adapter(
-            NewsAPIAdapter(
-                api_key=settings.newsapi_key,
-                timeout=settings.external_api_timeout_seconds,
-                query_terms=settings.news_query_terms,
-                page_size=settings.news_page_size,
-                signal_strength=settings.news_signal_strength,
+        if settings.newsapi_key:
+            ingestion.register_event_adapter(
+                NewsAPIAdapter(
+                    api_key=settings.newsapi_key,
+                    timeout=settings.external_api_timeout_seconds,
+                    query_terms=settings.news_query_terms,
+                    page_size=settings.news_page_size,
+                    signal_strength=settings.news_signal_strength,
+                )
             )
-        )
 
-    if settings.serpapi_key:
-        ingestion.register_event_adapter(
-            SerpAPITrendsAdapter(
-                api_key=settings.serpapi_key,
-                timeout=settings.external_api_timeout_seconds,
-                geo=settings.trends_geo,
-                signal_strength=settings.trends_signal_strength,
+        # SerpAPI trends: adapter is marked SUPPORTED=False (API discontinued).
+        # Do not register regardless of whether a key is set.
+        if settings.serpapi_key:
+            logger.warning(
+                "serpapi_key_set_but_adapter_unsupported",
+                reason=SerpAPITrendsAdapter.UNSUPPORTED_REASON,
             )
-        )
 
     # Correlation
     correlator = CorrelationEngine(
@@ -394,8 +425,12 @@ def inject_demo_data(pipeline: Pipeline):
 
 
 async def run_once(settings: Settings, demo: bool = False):
-    """Run a single processing cycle."""
-    pipeline, db = build_system(settings)
+    """Run a single processing cycle.
+
+    When *demo* is True, no live adapters are registered and only synthetic
+    data (injected by ``inject_demo_data``) is processed.
+    """
+    pipeline, db = build_system(settings, demo_mode=demo)
 
     if demo:
         inject_demo_data(pipeline)
@@ -535,7 +570,7 @@ def main():
     logger.info("system_starting", environment=settings.environment)
 
     # Run startup validation — fail fast with clear diagnostics
-    errors = validate_startup(settings)
+    errors = validate_startup(settings, demo_mode=args.demo)
     if errors:
         print("\n[STARTUP VALIDATION FAILED]", file=sys.stderr)
         for err in errors:
