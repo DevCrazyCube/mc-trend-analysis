@@ -7,7 +7,7 @@ logger = structlog.get_logger(__name__)
 
 # Increment this whenever the schema changes. Startup validation checks this
 # against the value stored in the schema_version table.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaVersionError(RuntimeError):
@@ -186,8 +186,12 @@ class Database:
                 description TEXT,
                 attention_score REAL CHECK(attention_score IS NULL OR (attention_score >= 0 AND attention_score <= 1)),
                 narrative_velocity REAL,
+                narrative_strength REAL CHECK(narrative_strength IS NULL OR (narrative_strength >= 0 AND narrative_strength <= 1)),
+                velocity_delta REAL,
+                velocity_state TEXT,
+                velocity_updated_at TEXT,
                 source_type_count INTEGER,
-                state TEXT NOT NULL DEFAULT 'active',
+                state TEXT NOT NULL DEFAULT 'WEAK',
                 sources TEXT,
                 first_detected TEXT NOT NULL,
                 peaked_at TEXT,
@@ -195,6 +199,10 @@ class Database:
                 updated_at TEXT NOT NULL,
                 extraction_confidence REAL CHECK(extraction_confidence IS NULL OR (extraction_confidence >= 0 AND extraction_confidence <= 1)),
                 ambiguous INTEGER CHECK(ambiguous IS NULL OR ambiguous IN (0, 1)),
+                cluster_id TEXT,
+                merged_into TEXT,
+                competition_status TEXT,
+                competition_rank INTEGER,
                 data_gaps TEXT
             )
         """)

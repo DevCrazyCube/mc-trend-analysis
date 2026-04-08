@@ -184,16 +184,44 @@ class NarrativeRepository:
         return _deserialize_row(cursor.fetchone())
 
     def get_active(self, states: list[str] | None = None, limit: int = 500) -> list[dict]:
-        """Return narratives in the given states (default: EMERGING, PEAKING)."""
+        """Return narratives in the given states.
+
+        Default states include both legacy (PEAKING) and new lifecycle states
+        (WEAK, EMERGING, RISING, TRENDING, FADING) — everything except DEAD and MERGED.
+        """
         if states is None:
-            states = ["EMERGING", "PEAKING"]
+            states = ["WEAK", "EMERGING", "RISING", "TRENDING", "FADING", "PEAKING"]
         placeholders = ", ".join("?" for _ in states)
         cursor = self.db.connection.execute(
             f"SELECT * FROM narratives WHERE state IN ({placeholders}) "
-            "ORDER BY attention_score DESC LIMIT ?",
+            "ORDER BY COALESCE(narrative_strength, attention_score, 0) DESC LIMIT ?",
             [*states, limit],
         )
         return _deserialize_rows(cursor.fetchall())
+
+    def get_for_scoring(self, limit: int = 500) -> list[dict]:
+        """Return narratives eligible for token scoring (EMERGING, RISING, TRENDING)."""
+        states = ["EMERGING", "RISING", "TRENDING"]
+        placeholders = ", ".join("?" for _ in states)
+        cursor = self.db.connection.execute(
+            f"SELECT * FROM narratives WHERE state IN ({placeholders}) "
+            "ORDER BY COALESCE(narrative_strength, attention_score, 0) DESC LIMIT ?",
+            [*states, limit],
+        )
+        return _deserialize_rows(cursor.fetchall())
+
+    def update_fields(self, narrative_id: str, fields: dict[str, Any]) -> None:
+        """Update specific fields on a narrative record."""
+        if not fields:
+            return
+        serialized = _serialize_row(fields)
+        set_clause = ", ".join(f"{k} = ?" for k in serialized)
+        values = list(serialized.values()) + [narrative_id]
+        self.db.connection.execute(
+            f"UPDATE narratives SET {set_clause} WHERE narrative_id = ?",
+            values,
+        )
+        self.db.connection.commit()
 
     def search_by_terms(self, terms: list[str], limit: int = 100) -> list[dict]:
         """Search narratives whose anchor_terms or related_terms contain any of *terms*."""

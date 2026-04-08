@@ -128,7 +128,7 @@ def normalize_event(raw: dict) -> dict | None:
         "attention_score": _safe_float(raw.get("signal_strength")) or 0.5,
         "narrative_velocity": None,   # Unknown at ingestion time; scoring uses conservative default (0.4)
         "source_type_count": 1,
-        "state": "EMERGING",
+        "state": "WEAK",
         "sources": [source],
         "first_detected": (published_at or now).isoformat(),
         "peaked_at": None,
@@ -202,21 +202,33 @@ def merge_narratives(existing: dict, new_source: dict) -> dict:
     """
     Merge a new event signal into an existing narrative record.
 
-    Updates attention score, adds source, updates lifecycle.
+    Updates attention score, adds or re-confirms source, updates lifecycle.
+    When a source is re-confirmed (same source_name already exists), its
+    ``last_updated`` timestamp is refreshed — this is critical for velocity
+    computation which counts source updates within the velocity window.
     """
-    # Add new source if from different source_name
     existing_sources = existing.get("sources", [])
-    existing_source_names = {s.get("source_name") for s in existing_sources}
     new_source_name = new_source.get("source_name", "unknown")
+    now = datetime.now(timezone.utc)
 
-    if new_source_name not in existing_source_names:
+    # Check if this source already exists
+    source_found = False
+    for src in existing_sources:
+        if src.get("source_name") == new_source_name:
+            # Re-confirmation: refresh last_updated for velocity computation
+            src["last_updated"] = now.isoformat()
+            src["signal_strength"] = _safe_float(new_source.get("signal_strength")) or src.get("signal_strength", 0.5)
+            source_found = True
+            break
+
+    if not source_found:
         source_entry = {
             "source_id": str(uuid.uuid4()),
             "source_type": new_source.get("source_type", "unknown"),
             "source_name": new_source_name,
             "signal_strength": _safe_float(new_source.get("signal_strength")) or 0.5,
-            "first_seen": new_source.get("published_at", datetime.now(timezone.utc).isoformat()),
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "first_seen": new_source.get("published_at", now.isoformat()),
+            "last_updated": now.isoformat(),
             "raw_reference": new_source.get("url"),
         }
         existing_sources.append(source_entry)
@@ -238,8 +250,6 @@ def merge_narratives(existing: dict, new_source: dict) -> dict:
         clean = t.strip().upper()
         if clean and clean not in set(existing.get("anchor_terms", [])):
             existing_related.add(clean)
-
-    now = datetime.now(timezone.utc)
 
     existing["sources"] = existing_sources
     existing["source_type_count"] = source_type_count

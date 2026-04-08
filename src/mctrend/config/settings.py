@@ -150,6 +150,61 @@ class OGResolutionConfig(BaseModel):
     weights: OGResolutionWeights = Field(default_factory=OGResolutionWeights)
 
 
+class NarrativeIntelligenceConfig(BaseModel):
+    """Configuration for narrative velocity, strength, lifecycle, and competition.
+
+    Reference: docs/intelligence/narrative-intelligence.md.
+    """
+
+    # Velocity
+    velocity_window_minutes: float = Field(
+        30.0, gt=0, description="Time window for velocity computation"
+    )
+    max_velocity: float = Field(
+        0.5, gt=0, description="Events/min that yields velocity_score of 1.0"
+    )
+
+    # Strength weights (must sum to 1.0)
+    strength_w_source_count: float = Field(0.30, ge=0.0, le=1.0)
+    strength_w_velocity: float = Field(0.35, ge=0.0, le=1.0)
+    strength_w_recency: float = Field(0.25, ge=0.0, le=1.0)
+    strength_w_diversity: float = Field(0.10, ge=0.0, le=1.0)
+    max_source_count: int = Field(5, gt=0)
+    recency_decay_minutes: float = Field(120.0, gt=0)
+    max_source_types: int = Field(4, gt=0)
+
+    # Lifecycle thresholds
+    min_sources: int = Field(2, ge=1, description="Minimum source count for EMERGING")
+    weak_threshold: float = Field(0.15, ge=0.0, le=1.0)
+    emerging_threshold: float = Field(0.20, ge=0.0, le=1.0)
+    rising_threshold: float = Field(0.35, ge=0.0, le=1.0)
+    trending_threshold: float = Field(0.55, ge=0.0, le=1.0)
+    trending_min_sources: int = Field(3, ge=1)
+    fading_threshold: float = Field(0.25, ge=0.0, le=1.0)
+    dead_threshold: float = Field(0.10, ge=0.0, le=1.0)
+    dead_timeout_minutes: float = Field(120.0, gt=0)
+
+    # Competition
+    winner_min_strength: float = Field(
+        0.30, ge=0.0, le=1.0, description="Minimum strength for a narrative to win competition"
+    )
+    token_competition_margin: float = Field(
+        0.05, ge=0.0, le=1.0, description="Score margin within which tokens are not suppressed"
+    )
+
+    @model_validator(mode="after")
+    def _strength_weights_sum(self) -> NarrativeIntelligenceConfig:
+        total = (
+            self.strength_w_source_count
+            + self.strength_w_velocity
+            + self.strength_w_recency
+            + self.strength_w_diversity
+        )
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"Narrative strength weights must sum to 1.0, got {total:.6f}")
+        return self
+
+
 class CorrelationConfig(BaseModel):
     """Configuration for the correlation / name-matching engine.
 
@@ -440,6 +495,11 @@ class Settings(BaseModel):
     # -- Correlation / OG resolution -------------------------------------------
     og_resolution: OGResolutionConfig = Field(default_factory=OGResolutionConfig)
     correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
+
+    # -- Narrative intelligence ------------------------------------------------
+    narrative_intelligence: NarrativeIntelligenceConfig = Field(
+        default_factory=NarrativeIntelligenceConfig
+    )
 
     # -- Alert classification -------------------------------------------------
     alert_thresholds: AlertThresholds = Field(default_factory=AlertThresholds)

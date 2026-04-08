@@ -26,6 +26,10 @@ from mctrend.alerting.engine import AlertEngine
 from mctrend.correlation.linker import CorrelationEngine
 from mctrend.delivery.channels import DeliveryRouter
 from mctrend.ingestion.manager import IngestionManager
+from mctrend.narrative.intelligence import (
+    NarrativeConfig,
+    NarrativeIntelligence,
+)
 from mctrend.normalization.normalizer import (
     merge_narratives,
     normalize_event,
@@ -78,6 +82,34 @@ class Pipeline:
         self.alert_repo = AlertRepository(db)
         self.gap_repo = SourceGapRepository(db)
         self.rejected_repo = RejectedCandidateRepository(db)
+
+        # Narrative intelligence engine
+        ni_cfg = NarrativeConfig()
+        if settings and hasattr(settings, "narrative_intelligence"):
+            ni = settings.narrative_intelligence
+            ni_cfg = NarrativeConfig(
+                velocity_window_minutes=ni.velocity_window_minutes,
+                max_velocity=ni.max_velocity,
+                strength_w_source_count=ni.strength_w_source_count,
+                strength_w_velocity=ni.strength_w_velocity,
+                strength_w_recency=ni.strength_w_recency,
+                strength_w_diversity=ni.strength_w_diversity,
+                max_source_count=ni.max_source_count,
+                recency_decay_minutes=ni.recency_decay_minutes,
+                max_source_types=ni.max_source_types,
+                min_sources=ni.min_sources,
+                weak_threshold=ni.weak_threshold,
+                emerging_threshold=ni.emerging_threshold,
+                rising_threshold=ni.rising_threshold,
+                trending_threshold=ni.trending_threshold,
+                trending_min_sources=ni.trending_min_sources,
+                fading_threshold=ni.fading_threshold,
+                dead_threshold=ni.dead_threshold,
+                dead_timeout_minutes=ni.dead_timeout_minutes,
+                winner_min_strength=ni.winner_min_strength,
+                token_competition_margin=ni.token_competition_margin,
+            )
+        self.narrative_intel = NarrativeIntelligence(ni_cfg)
 
         # Stats
         self._cycle_count = 0
@@ -167,11 +199,37 @@ class Pipeline:
 
         summary["events_ingested"] = len(new_events)
 
-        # Step 4: Correlate tokens with narratives
+        # Step 3.5: Evaluate all non-terminal narratives through intelligence engine
+        # Computes velocity, strength, and lifecycle state for each narrative.
+        narratives_evaluated = 0
         try:
-            active_narratives = self.narrative_repo.get_active(
-                states=["EMERGING", "PEAKING"]
-            )
+            all_narratives = self.narrative_repo.get_active()
+            now = datetime.now(timezone.utc)
+            for narrative in all_narratives:
+                try:
+                    updates = self.narrative_intel.transition_narrative(narrative, now)
+                    if updates:
+                        nid = narrative.get("narrative_id")
+                        self.narrative_repo.update_fields(nid, updates)
+                        narratives_evaluated += 1
+                except Exception as e:
+                    logger.error(
+                        "narrative_evaluation_error",
+                        narrative_id=narrative.get("narrative_id"),
+                        error=str(e),
+                    )
+            if narratives_evaluated:
+                logger.info("narratives_evaluated", count=narratives_evaluated)
+        except Exception as e:
+            logger.error("pipeline_narrative_eval_error", error=str(e))
+            summary["errors"].append(f"narrative_eval: {e}")
+
+        summary["narratives_evaluated"] = narratives_evaluated
+
+        # Step 4: Correlate tokens with narratives
+        # Use scoring-eligible narratives for correlation (EMERGING, RISING, TRENDING)
+        try:
+            active_narratives = self.narrative_repo.get_for_scoring()
             tokens_to_correlate = self.token_repo.list_by_status("new", limit=200)
 
             links_created = 0
@@ -233,9 +291,13 @@ class Pipeline:
             logger.error("pipeline_correlation_error", error=str(e))
             summary["errors"].append(f"correlation: {e}")
 
-        # Step 5 & 6: Score linked tokens and classify alerts
+        # Step 5 & 6: Score linked tokens, apply quality gating & competition, classify alerts
         linked_tokens = self.token_repo.list_by_status("linked", limit=200)
         scored_count = 0
+        quality_gated_count = 0
+
+        # Collect all scored tokens per narrative for competition layer
+        narrative_scored_tokens: dict[str, list[dict]] = {}
 
         for token in linked_tokens:
             token_links = self.link_repo.get_for_token(token["token_id"])
@@ -245,6 +307,18 @@ class Pipeline:
 
                 narrative = self.narrative_repo.get_by_id(link["narrative_id"])
                 if narrative is None:
+                    continue
+
+                # Quality gate: skip narratives not meeting scoring eligibility
+                if not self.narrative_intel.is_scoring_eligible(narrative):
+                    reason = self.narrative_intel.get_rejection_reason(narrative)
+                    logger.debug(
+                        "narrative_quality_gate_blocked",
+                        narrative_id=narrative.get("narrative_id"),
+                        state=narrative.get("state"),
+                        reason=reason,
+                    )
+                    quality_gated_count += 1
                     continue
 
                 try:
@@ -267,33 +341,14 @@ class Pipeline:
                     self.scoring_repo.save(scored)
                     scored_count += 1
 
-                    # Step 6: Alert classification
-                    alert = self.alert_engine.process_scored_token(
-                        scored_token=scored,
-                        token=token,
-                        narrative=narrative,
-                        link=link,
-                    )
-
-                    if alert:
-                        summary["alerts_created"] += 1
-                        self._total_alerts_generated += 1
-
-                        # Step 7: Deliver and persist delivery records
-                        logs = await self.delivery.deliver_alert(alert)
-                        for log in logs:
-                            try:
-                                self.alert_repo.save_delivery(log)
-                            except Exception as e:
-                                logger.error("delivery_log_persist_error", error=str(e))
-                        summary["alerts_delivered"] += sum(
-                            1 for l in logs if l.get("status") == "delivered"
-                        )
-                    else:
-                        # Token was classified as 'ignore' with no prior alert.
-                        # Log and persist structured rejection reasons so the
-                        # dashboard can show why scored tokens are not alerting.
-                        self._handle_rejection(scored, token, narrative)
+                    # Collect for competition layer
+                    nid = link["narrative_id"]
+                    narrative_scored_tokens.setdefault(nid, []).append({
+                        "scored": scored,
+                        "token": token,
+                        "narrative": narrative,
+                        "link": link,
+                    })
 
                 except Exception as e:
                     logger.error(
@@ -315,7 +370,85 @@ class Pipeline:
                              token_id=token.get("token_id"), error=str(e))
 
         summary["tokens_scored"] = scored_count
+        summary["quality_gated"] = quality_gated_count
         self._total_tokens_processed += scored_count
+
+        # Step 5.5: Competition layer — select token winners within each narrative
+        # and apply alert gating based on narrative state.
+        # Check if any narratives are RISING+ for alert fallback logic.
+        has_rising = any(
+            items[0]["narrative"].get("state") in ("RISING", "TRENDING")
+            for items in narrative_scored_tokens.values()
+            if items
+        )
+
+        for nid, items in narrative_scored_tokens.items():
+            # Token competition: rank tokens within this narrative
+            tokens_for_competition = [
+                {
+                    "token_id": item["token"]["token_id"],
+                    "net_potential": item["scored"].get("net_potential", 0.0) or 0.0,
+                    "_item": item,
+                }
+                for item in items
+            ]
+
+            ranked = self.narrative_intel.select_token_winners(tokens_for_competition)
+
+            for entry in ranked:
+                item = entry["_item"]
+                scored = item["scored"]
+                token = item["token"]
+                narrative = item["narrative"]
+                link = item["link"]
+                competition_status = entry.get("token_competition_status", "winner")
+
+                # Alert gating: narrative must be alert-eligible
+                if not self.narrative_intel.is_alert_eligible(narrative, has_rising):
+                    logger.info(
+                        "alert_narrative_gate_failed",
+                        token_id=token.get("token_id"),
+                        narrative_id=narrative.get("narrative_id"),
+                        narrative_state=narrative.get("state"),
+                    )
+                    self._handle_rejection(scored, token, narrative)
+                    continue
+
+                # Token must be winner or within margin
+                if competition_status == "suppressed":
+                    logger.info(
+                        "token_outcompeted",
+                        token_id=token.get("token_id"),
+                        narrative_id=narrative.get("narrative_id"),
+                        competition_status=competition_status,
+                    )
+                    self._handle_rejection(scored, token, narrative)
+                    continue
+
+                # Step 6: Alert classification
+                alert = self.alert_engine.process_scored_token(
+                    scored_token=scored,
+                    token=token,
+                    narrative=narrative,
+                    link=link,
+                )
+
+                if alert:
+                    summary["alerts_created"] += 1
+                    self._total_alerts_generated += 1
+
+                    # Step 7: Deliver and persist delivery records
+                    logs = await self.delivery.deliver_alert(alert)
+                    for log in logs:
+                        try:
+                            self.alert_repo.save_delivery(log)
+                        except Exception as e:
+                            logger.error("delivery_log_persist_error", error=str(e))
+                    summary["alerts_delivered"] += sum(
+                        1 for l in logs if l.get("status") == "delivered"
+                    )
+                else:
+                    self._handle_rejection(scored, token, narrative)
 
         # Step 8: Expire stale alerts and retire old ones
         try:
@@ -533,9 +666,11 @@ class Pipeline:
             "match_confidence": link.get("match_confidence", 0.5),
             "narrative_age_hours": age_hours,
             "source_type_count": narrative.get("source_type_count", 1),
-            "state": narrative.get("state", "EMERGING"),
+            "state": narrative.get("state", "WEAK"),
             "attention_score": narrative.get("attention_score", 0.5),
             "narrative_velocity": narrative.get("narrative_velocity", 0.0),
+            "narrative_strength": narrative.get("narrative_strength"),
+            "velocity_state": narrative.get("velocity_state"),
         }
 
     def _build_link_data(self, link: dict) -> dict:

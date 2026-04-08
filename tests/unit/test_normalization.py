@@ -103,7 +103,7 @@ class TestNormalizeEvent:
         result = normalize_event(raw)
         assert result is not None
         assert "DEEPMIND" in result["anchor_terms"]
-        assert result["state"] == "EMERGING"
+        assert result["state"] == "WEAK"
         assert result["attention_score"] == 0.8
 
     def test_no_anchor_terms_rejected(self):

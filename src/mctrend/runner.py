@@ -29,7 +29,7 @@ from mctrend.ingestion.adapters.pumpportal_ws import PumpPortalWebSocketAdapter
 from mctrend.ingestion.adapters.solana_rpc import SolanaRPCAdapter
 from mctrend.ingestion.adapters.trends import SerpAPITrendsAdapter
 from mctrend.ingestion.manager import IngestionManager
-from mctrend.normalization.normalizer import normalize_event, normalize_token
+from mctrend.normalization.normalizer import merge_narratives, normalize_event, normalize_token
 from mctrend.persistence.database import Database, SchemaVersionError
 from mctrend.persistence.repositories import (
     AlertRepository,
@@ -355,10 +355,54 @@ def inject_demo_data(pipeline: Pipeline):
         },
     ]
 
+    # Second-source confirmations to meet min_sources threshold for EMERGING
+    confirmations = [
+        {
+            "anchor_terms": ["DEEPMIND", "GOOGLE", "AI"],
+            "source_type": "search_trends",
+            "source_name": "demo_trends",
+            "signal_strength": 0.80,
+            "published_at": now.isoformat(),
+        },
+        {
+            "anchor_terms": ["MOONDOG", "SPACE", "DOG"],
+            "source_type": "news",
+            "source_name": "demo_news",
+            "signal_strength": 0.75,
+            "published_at": now.isoformat(),
+        },
+        {
+            "anchor_terms": ["BRAVADO", "BOXING", "CHAMPION"],
+            "source_type": "search_trends",
+            "source_name": "demo_trends",
+            "signal_strength": 0.70,
+            "published_at": now.isoformat(),
+        },
+    ]
+
     for raw_event in narratives:
         normalized = normalize_event(raw_event)
         if normalized:
             pipeline.narrative_repo.save(normalized)
+
+    # Merge second sources into existing narratives (provides multi-source confirmation)
+    for conf in confirmations:
+        existing = pipeline._find_matching_narrative(
+            [t.strip().upper() for t in conf["anchor_terms"]]
+        )
+        if existing:
+            merged = merge_narratives(existing, conf)
+            pipeline.narrative_repo.save(merged)
+
+    # Run narrative intelligence evaluation so narratives reach EMERGING+
+    from mctrend.narrative.intelligence import NarrativeConfig, NarrativeIntelligence
+
+    ni = getattr(pipeline, "narrative_intel", NarrativeIntelligence(NarrativeConfig()))
+    all_narrs = pipeline.narrative_repo.get_active()
+    for narr in all_narrs:
+        updates = ni.transition_narrative(narr, now)
+        if updates:
+            pipeline.narrative_repo.update_fields(narr["narrative_id"], updates)
 
     # Create tokens that match these narratives
     tokens = [
