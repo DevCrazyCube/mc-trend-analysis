@@ -167,8 +167,8 @@ Multiple narratives about the same topic may exist with different anchor terms o
 
 Multi-signal deterministic clustering using union-find:
 
-1. **Anchor Term Overlap**: Two narratives share >= `cluster_term_overlap_pct` (default 50%) of their anchor terms (case-insensitive).
-2. **Broad Term Overlap**: Anchor + related terms overlap >= `cluster_term_overlap_pct`.
+1. **Anchor Term Overlap**: Two narratives share >= 2 anchor terms AND the overlap fraction (computed as `shared_count / max(len(terms_a), len(terms_b))`) meets `cluster_term_overlap_pct` (default 50%). The max-denominator prevents false merges from tiny term sets (a single shared term out of 1 would give 100% on a min-denominator).
+2. **Broad Term Overlap**: Anchor + related terms overlap follows the same rule: >= 2 shared terms AND `shared_count / max(len_a, len_b) >= cluster_term_overlap_pct`.
 3. **Entity Overlap**: Two narratives share >= 1 named entity (name + type match).
 4. **Token Overlap**: Two narratives have >= `cluster_token_overlap_min` (default 2) tokens linked to both.
 5. **Explicit Merge**: During `merge_narratives`, if an incoming event matches an existing narrative by anchor terms, merge rather than create.
@@ -312,6 +312,16 @@ The system must prefer no output over low-confidence output. Observable cycles w
 - If no narrative reaches RISING: zero alerts. No fallback.
 - If no token meets scoring thresholds: zero alerts. No runner-up promotion.
 - If all narratives are WEAK or FADING: zero alerts. The system waits.
+
+### Observable Silence
+
+Silence is **not** an absence of information — it is a positive signal. The system exposes silence through:
+
+- **`GET /api/health/silence`**: Returns structured `silence_reasons` array with machine-readable codes explaining exactly why no alerts were produced (e.g., `no_narrative_reached_alert_eligibility`, `no_narrative_won_competition`, `all_token_candidates_suppressed`).
+- **`GET /api/competition`**: Shows the full competition outcome — every narrative's status, every token's rank, every suppression reason. Zero winners is visible, not hidden.
+- **`GET /api/candidates`**: Shows tokens that were scored but didn't cross alert thresholds, with per-tier gap analysis.
+
+These endpoints make the difference between "nothing happened because nothing was strong enough" and "nothing happened because something is broken" immediately visible.
 
 The system tolerates inactivity rather than emitting weak signals.
 

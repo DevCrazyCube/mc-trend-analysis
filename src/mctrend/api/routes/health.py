@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends
 
 from mctrend.api.auth import require_auth
 from mctrend.api.deps import (
+    get_competition_outcomes,
     get_cycle_stats,
     get_db,
     get_pipeline_start_time,
@@ -136,3 +137,121 @@ async def get_source_health(
         sources.setdefault(sname, {})["open_gaps"] = gaps
 
     return {"sources": sources}
+
+
+@router.get("/silence")
+async def get_silence_explanation(
+    _: None = Depends(require_auth),
+    db=Depends(get_db),
+):
+    """Explain why the system produced zero alerts in the last cycle.
+
+    Returns structured silence reasons so operators can distinguish between
+    "nothing happened because the system is broken" and "nothing happened
+    because no signal was strong enough" — the latter is expected behavior.
+    """
+    cycle_stats = get_cycle_stats()
+    competition = get_competition_outcomes()
+
+    # If no cycle has run yet
+    if not cycle_stats:
+        return {
+            "silent": True,
+            "reason": "no_cycle_completed",
+            "detail": "No pipeline cycle has completed yet.",
+            "silence_reasons": [],
+            "last_cycle": None,
+        }
+
+    alerts_created = cycle_stats.get("alerts_created", 0)
+    if alerts_created > 0:
+        return {
+            "silent": False,
+            "reason": "alerts_were_created",
+            "detail": f"{alerts_created} alert(s) created in cycle {cycle_stats.get('cycle')}.",
+            "silence_reasons": [],
+            "last_cycle": cycle_stats.get("cycle"),
+        }
+
+    # System is silent — explain why
+    silence_reasons = []
+
+    # Check: no tokens ingested
+    if cycle_stats.get("tokens_ingested", 0) == 0 and cycle_stats.get("tokens_scored", 0) == 0:
+        silence_reasons.append({
+            "code": "no_tokens_available",
+            "detail": "No tokens were ingested or scored this cycle.",
+        })
+
+    # Check: no narratives at alert-eligible states
+    narrative_repo = NarrativeRepository(db)
+    rising = narrative_repo.get_active(states=["RISING"])
+    trending = narrative_repo.get_active(states=["TRENDING"])
+    if not rising and not trending:
+        all_states = {}
+        for state in ["WEAK", "EMERGING", "RISING", "TRENDING", "FADING", "DEAD"]:
+            count = len(narrative_repo.get_active(states=[state]))
+            if count > 0:
+                all_states[state] = count
+        silence_reasons.append({
+            "code": "no_narrative_reached_alert_eligibility",
+            "detail": "No narrative is in RISING or TRENDING state. Alerts require RISING+.",
+            "narrative_state_counts": all_states,
+        })
+
+    # Check: competition outcomes — all below threshold or outcompeted
+    narr_outcomes = competition.get("narrative_outcomes", [])
+    if narr_outcomes:
+        winners = [n for n in narr_outcomes if n.get("competition_status") in ("winner", "no_contest")]
+        if not winners:
+            silence_reasons.append({
+                "code": "no_narrative_won_competition",
+                "detail": "All narratives were either outcompeted or below the strength threshold.",
+                "narrative_count": len(narr_outcomes),
+            })
+
+    # Check: all candidates suppressed at token level
+    tok_outcomes = competition.get("token_outcomes", [])
+    if tok_outcomes:
+        token_winners = [t for t in tok_outcomes if t.get("token_competition_status") == "winner"]
+        if not token_winners:
+            silence_reasons.append({
+                "code": "all_token_candidates_suppressed",
+                "detail": "All token candidates were suppressed during competition.",
+            })
+
+    # Check: suppressed count
+    suppressed = cycle_stats.get("suppressed", 0)
+    quality_gated = cycle_stats.get("quality_gated", 0)
+    if suppressed > 0 or quality_gated > 0:
+        silence_reasons.append({
+            "code": "candidates_filtered",
+            "detail": f"{quality_gated} quality-gated, {suppressed} suppressed by competition/gating.",
+            "quality_gated": quality_gated,
+            "suppressed": suppressed,
+        })
+
+    # Check: errors
+    errors = cycle_stats.get("errors", [])
+    if errors:
+        silence_reasons.append({
+            "code": "cycle_had_errors",
+            "detail": f"Cycle encountered {len(errors)} error(s) that may have prevented alerts.",
+            "errors": errors,
+        })
+
+    # Default: explain this is expected
+    if not silence_reasons:
+        silence_reasons.append({
+            "code": "no_actionable_signal",
+            "detail": "No signal met all thresholds. This is expected when no strong trend exists.",
+        })
+
+    return {
+        "silent": True,
+        "reason": "no_alerts_created",
+        "detail": f"Cycle {cycle_stats.get('cycle')} completed with 0 alerts. "
+                  "Silence is expected when no dominant signal exists.",
+        "silence_reasons": silence_reasons,
+        "last_cycle": cycle_stats.get("cycle"),
+    }

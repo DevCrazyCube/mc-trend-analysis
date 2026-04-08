@@ -541,7 +541,10 @@ class NarrativeIntelligence:
             nid = n.get("narrative_id", "")
             parent[nid] = nid
 
-        # 1. Term overlap: >= cluster_term_overlap_pct of anchor terms shared
+        # 1. Term and entity overlap
+        # Uses max(len) as denominator to avoid false merges from tiny term sets.
+        # A single shared term out of 1 would give 100% on min-denominator;
+        # max-denominator requires both sides to share a meaningful fraction.
         for i, n1 in enumerate(narratives):
             terms1 = {t.upper() for t in (n1.get("anchor_terms") or [])}
             all_terms1 = terms1 | {t.upper() for t in (n1.get("related_terms") or [])}
@@ -557,21 +560,21 @@ class NarrativeIntelligence:
                 if not terms2:
                     continue
 
-                # Check anchor term overlap
+                # Check anchor term overlap (max-denominator to prevent single-term merges)
                 overlap = len(terms1 & terms2)
-                min_size = min(len(terms1), len(terms2))
-                if min_size > 0 and overlap / min_size >= self.cfg.cluster_term_overlap_pct:
+                max_size = max(len(terms1), len(terms2))
+                if overlap >= 2 and max_size > 0 and overlap / max_size >= self.cfg.cluster_term_overlap_pct:
                     union(nid1, nid2)
                     continue
 
-                # Check broader term overlap (anchor + related)
+                # Check broader term overlap (anchor + related, max-denominator)
                 broad_overlap = len(all_terms1 & all_terms2)
-                broad_min = min(len(all_terms1), len(all_terms2))
-                if broad_min > 0 and broad_overlap / broad_min >= self.cfg.cluster_term_overlap_pct:
+                broad_max = max(len(all_terms1), len(all_terms2))
+                if broad_overlap >= 2 and broad_max > 0 and broad_overlap / broad_max >= self.cfg.cluster_term_overlap_pct:
                     union(nid1, nid2)
                     continue
 
-                # Check shared entity names
+                # Check shared entity names (name + type must match)
                 entities1 = {
                     (e.get("name", "").upper(), e.get("type", ""))
                     for e in (n1.get("entities") or [])
@@ -692,12 +695,13 @@ class NarrativeIntelligence:
         self,
         scored_tokens: list[dict],
     ) -> list[dict]:
-        """Select winner tokens within a narrative.
+        """Select winner tokens within a narrative — strict winner-takes-all.
 
-        Strict winner-takes-all: only the #1 token is the winner.
-        All others are suppressed UNLESS they EXCEED the winner by the
-        configured margin (explicit override — this handles the rare case
-        where scoring order differs from net_potential order).
+        Sort by net_potential descending.  Index 0 is the winner.
+        All others are suppressed — no override, no margin pass-through.
+
+        Tokens close to the winner (within ``token_competition_margin``) get an
+        additional informational suppression code so operators can see near-misses.
 
         Input: list of scored token dicts with at least net_potential and token_id.
         Returns the same list annotated with:
@@ -715,7 +719,6 @@ class NarrativeIntelligence:
         )
 
         winner_score = sorted_tokens[0].get("net_potential", 0.0) or 0.0
-        winner_id = sorted_tokens[0].get("token_id", "")
 
         results = []
         for i, t in enumerate(sorted_tokens):
@@ -723,6 +726,7 @@ class NarrativeIntelligence:
             score = t.get("net_potential", 0.0) or 0.0
 
             if i == 0:
+                # Winner: rank 1, no suppression
                 annotated["token_competition_status"] = "winner"
                 annotated["suppression_reasons"] = []
                 annotated["winner_explanation"] = {
@@ -733,29 +737,20 @@ class NarrativeIntelligence:
                         score - (sorted_tokens[1].get("net_potential", 0.0) or 0.0), 4
                     ) if len(sorted_tokens) > 1 else None,
                 }
-            elif score > winner_score + self.cfg.token_competition_margin:
-                # Explicit override: this token exceeds the winner by margin
-                # (should not happen given sorting, but guards against edge cases)
-                annotated["token_competition_status"] = "winner"
-                annotated["suppression_reasons"] = []
-                annotated["winner_explanation"] = {
-                    "net_potential": round(score, 4),
-                    "rank": i + 1,
-                    "total_competitors": len(sorted_tokens),
-                    "override_reason": "exceeds_winner_by_margin",
-                }
             else:
+                # Suppressed: every non-winner token, no exceptions
                 annotated["token_competition_status"] = "suppressed"
+                delta = winner_score - score
                 suppression = [{
                     "code": SUPPRESSION_LOST_TO_STRONGER_TOKEN,
                     "actual": round(score, 4),
                     "threshold": round(winner_score, 4),
-                    "detail": f"net_potential {score:.4f} < winner {winner_score:.4f} (delta {winner_score - score:.4f})",
+                    "detail": f"net_potential {score:.4f} < winner {winner_score:.4f} (delta {delta:.4f})",
                 }]
-                if winner_score - score <= self.cfg.token_competition_margin:
+                if delta <= self.cfg.token_competition_margin:
                     suppression.append({
                         "code": SUPPRESSION_WINNER_MARGIN_NOT_MET,
-                        "actual": round(winner_score - score, 4),
+                        "actual": round(delta, 4),
                         "threshold": self.cfg.token_competition_margin,
                         "detail": f"within margin {self.cfg.token_competition_margin} but strict winner-takes-all enforced",
                     })

@@ -21,6 +21,7 @@ _db: "Database | None" = None
 _ws_adapter: "PumpPortalWebSocketAdapter | None" = None
 _pipeline_start_time: float | None = None
 _cycle_stats: dict = {}
+_competition_outcomes: dict = {}
 
 
 def set_db(db: "Database") -> None:
@@ -59,3 +60,12 @@ def update_cycle_stats(summary: dict) -> None:
 
 def get_cycle_stats() -> dict:
     return _cycle_stats
+
+
+def update_competition_outcomes(outcomes: dict) -> None:
+    global _competition_outcomes
+    _competition_outcomes = outcomes
+
+
+def get_competition_outcomes() -> dict:
+    return _competition_outcomes

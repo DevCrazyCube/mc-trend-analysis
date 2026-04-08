@@ -668,6 +668,13 @@ class TestClustering:
         result = engine.cluster_narratives([n1, n2])
         assert result["n1"] != result["n2"]
 
+    def test_single_term_overlap_no_cluster(self, engine):
+        """Single shared anchor term must NOT trigger clustering (false merge guard)."""
+        n1 = _make_narrative(narrative_id="n1", anchor_terms=["AI", "HEALTHCARE"])
+        n2 = _make_narrative(narrative_id="n2", anchor_terms=["AI", "MEMECOINS"])
+        result = engine.cluster_narratives([n1, n2])
+        assert result["n1"] != result["n2"]
+
     def test_token_overlap_clusters(self, engine):
         """Narratives sharing >= 2 linked tokens should cluster."""
         n1 = _make_narrative(narrative_id="n1", anchor_terms=["FOO"])
@@ -718,9 +725,10 @@ class TestClustering:
 
     def test_transitive_clustering(self, engine):
         """If A clusters with B and B clusters with C, all three should share a cluster."""
-        n1 = _make_narrative(narrative_id="n1", anchor_terms=["DEEPMIND", "AI"])
-        n2 = _make_narrative(narrative_id="n2", anchor_terms=["DEEPMIND", "GOOGLE"])
-        n3 = _make_narrative(narrative_id="n3", anchor_terms=["GOOGLE", "GEMINI"])
+        # Each adjacent pair shares >= 2 terms with sufficient overlap ratio
+        n1 = _make_narrative(narrative_id="n1", anchor_terms=["DEEPMIND", "AI", "RESEARCH"])
+        n2 = _make_narrative(narrative_id="n2", anchor_terms=["DEEPMIND", "AI", "GOOGLE"])
+        n3 = _make_narrative(narrative_id="n3", anchor_terms=["DEEPMIND", "GOOGLE", "GEMINI"])
         result = engine.cluster_narratives([n1, n2, n3])
         assert result["n1"] == result["n2"] == result["n3"]
 

@@ -665,6 +665,12 @@ async def run_continuous(settings: Settings, dashboard: bool = False):
 
             # Update dashboard cycle stats and broadcast
             api_deps.update_cycle_stats(summary)
+            api_deps.update_competition_outcomes({
+                "cycle": summary.get("cycle"),
+                "started_at": summary.get("started_at"),
+                "narrative_outcomes": summary.get("competition_outcomes", []),
+                "token_outcomes": summary.get("token_competition_outcomes", []),
+            })
             broadcast("cycle_complete", summary)
 
             if summary.get("errors"):

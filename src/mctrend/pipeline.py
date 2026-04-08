@@ -252,6 +252,46 @@ class Pipeline:
             logger.error("pipeline_clustering_error", error=str(e))
             summary["errors"].append(f"clustering: {e}")
 
+        # Step 3.7: Narrative competition — select winners per cluster group.
+        # Persist competition_status and competition_rank on narratives.
+        # Store full outcomes for dashboard visibility.
+        competition_outcomes: list[dict] = []
+        try:
+            fresh_scoring = self.narrative_repo.get_for_scoring()
+            if fresh_scoring:
+                ranked = self.narrative_intel.select_narrative_winners(fresh_scoring)
+                for n in ranked:
+                    nid = n.get("narrative_id", "")
+                    self.narrative_repo.update_fields(nid, {
+                        "competition_status": n.get("competition_status"),
+                        "competition_rank": n.get("competition_rank"),
+                    })
+                    competition_outcomes.append({
+                        "narrative_id": nid,
+                        "narrative_name": n.get("description", n.get("name")),
+                        "state": n.get("state"),
+                        "narrative_strength": n.get("narrative_strength"),
+                        "velocity_state": n.get("velocity_state"),
+                        "cluster_id": n.get("cluster_id"),
+                        "competition_status": n.get("competition_status"),
+                        "competition_rank": n.get("competition_rank"),
+                        "suppression_reasons": n.get("suppression_reasons", []),
+                        "winner_explanation": n.get("winner_explanation"),
+                    })
+                logger.info(
+                    "narrative_competition_complete",
+                    total=len(ranked),
+                    winners=sum(
+                        1 for n in ranked
+                        if n.get("competition_status") in ("winner", "no_contest")
+                    ),
+                )
+        except Exception as e:
+            logger.error("pipeline_narrative_competition_error", error=str(e))
+            summary["errors"].append(f"narrative_competition: {e}")
+
+        summary["competition_outcomes"] = competition_outcomes
+
         # Step 4: Correlate tokens with narratives
         # Use scoring-eligible narratives for correlation (EMERGING, RISING, TRENDING)
         try:
@@ -404,6 +444,7 @@ class Pipeline:
         # Only rank-1 token per narrative proceeds to alert classification.
         # All others are suppressed with structured reasons.
         suppressed_count = 0
+        token_competition_outcomes: list[dict] = []
 
         for nid, items in narrative_scored_tokens.items():
             # Token competition: rank tokens within this narrative
@@ -417,6 +458,17 @@ class Pipeline:
             ]
 
             ranked = self.narrative_intel.select_token_winners(tokens_for_competition)
+
+            for entry in ranked:
+                token_competition_outcomes.append({
+                    "narrative_id": nid,
+                    "token_id": entry.get("token_id"),
+                    "token_name": entry["_item"]["token"].get("name"),
+                    "net_potential": entry.get("net_potential"),
+                    "token_competition_status": entry.get("token_competition_status"),
+                    "suppression_reasons": entry.get("suppression_reasons", []),
+                    "winner_explanation": entry.get("winner_explanation"),
+                })
 
             for entry in ranked:
                 item = entry["_item"]
@@ -486,6 +538,7 @@ class Pipeline:
                     self._handle_rejection(scored, token, narrative)
 
         summary["suppressed"] = suppressed_count
+        summary["token_competition_outcomes"] = token_competition_outcomes
 
         # Step 8: Expire stale alerts and retire old ones
         try:

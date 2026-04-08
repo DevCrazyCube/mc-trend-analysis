@@ -5,6 +5,8 @@ Mount points:
   /api/tokens        — token explorer
   /api/narratives    — narrative explorer
   /api/alerts        — alert center
+  /api/candidates    — rejected candidate diagnostics
+  /api/competition   — competition outcomes (winners, suppressed, reasons)
   /api/config        — configuration read/update
   /api/holdings      — manual holdings / positions
   /api/notifications — operator notification feed
@@ -26,6 +28,7 @@ from mctrend.api.auth import auth_is_configured
 from mctrend.api.routes import (
     alerts,
     candidates,
+    competition,
     config,
     events,
     health,
@@ -71,6 +74,7 @@ def create_app() -> FastAPI:
     app.include_router(narratives.router)
     app.include_router(alerts.router)
     app.include_router(candidates.router)
+    app.include_router(competition.router)
     app.include_router(config.router)
     app.include_router(holdings.router)
     app.include_router(notifications.router)
