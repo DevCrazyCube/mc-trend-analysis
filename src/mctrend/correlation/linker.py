@@ -65,9 +65,9 @@ class CorrelationEngine:
         token_name = token.get("name", "")
         if _is_spam_token_name(token_name):
             logger.info(
-                "token_rejected_spam_name",
-                token_id=token["token_id"],
-                token_name=token_name,
+                "Token %s rejected: spam/promotional name '%s'",
+                token["token_id"],
+                token_name,
             )
             return []
 
@@ -89,13 +89,13 @@ class CorrelationEngine:
                     token["name"], result.get("matched_term", ""), result["confidence"]
                 ):
                     logger.info(
-                        "token_narrative_link_rejected",
-                        token_id=token["token_id"],
-                        narrative_id=narrative["narrative_id"],
-                        reason="weak_abbreviation_match",
-                        method=result["method"],
-                        confidence=round(result["confidence"], 3),
-                        matched_term=result.get("matched_term", ""),
+                        "Token %s rejected match with narrative %s: weak %s match "
+                        "(confidence=%.3f, term=%s)",
+                        token["token_id"],
+                        narrative["narrative_id"],
+                        result["method"],
+                        result["confidence"],
+                        result.get("matched_term", ""),
                     )
                     continue
 
@@ -107,13 +107,13 @@ class CorrelationEngine:
             links.append(link)
 
             logger.info(
-                "token_linked_to_narrative",
-                token_id=token["token_id"],
-                token_name=token_name,
-                narrative_id=narrative["narrative_id"],
-                method=result["method"],
-                confidence=round(result["confidence"], 3),
-                matched_term=result.get("matched_term"),
+                "Token %s linked to narrative %s (name=%s, method=%s, confidence=%.3f, term=%s)",
+                token["token_id"],
+                narrative["narrative_id"],
+                token_name,
+                result["method"],
+                result["confidence"],
+                result.get("matched_term"),
             )
 
         return links
@@ -146,9 +146,9 @@ class CorrelationEngine:
             token_name = token.get("name", "")
             if _is_spam_token_name(token_name):
                 logger.debug(
-                    "token_rejected_spam_name",
-                    token_id=token["token_id"],
-                    token_name=token_name,
+                    "Token %s rejected: spam/promotional name '%s'",
+                    token["token_id"],
+                    token_name,
                 )
                 continue
 
@@ -168,12 +168,12 @@ class CorrelationEngine:
                     token["name"], result.get("matched_term", ""), result["confidence"]
                 ):
                     logger.debug(
-                        "token_narrative_link_rejected",
-                        token_id=token["token_id"],
-                        narrative_id=narrative["narrative_id"],
-                        reason="weak_abbreviation_match",
-                        method=result["method"],
-                        confidence=round(result["confidence"], 3),
+                        "Token %s rejected match with narrative %s: weak %s match "
+                        "(confidence=%.3f)",
+                        token["token_id"],
+                        narrative["narrative_id"],
+                        result["method"],
+                        result["confidence"],
                     )
                     continue
 
@@ -185,13 +185,12 @@ class CorrelationEngine:
             links.append(link)
 
             logger.info(
-                "narrative_linked_to_token",
-                narrative_id=narrative["narrative_id"],
-                token_id=token["token_id"],
-                token_name=token_name,
-                method=result["method"],
-                confidence=round(result["confidence"], 3),
-                matched_term=result.get("matched_term"),
+                "Narrative %s linked to token %s (name=%s, method=%s, confidence=%.3f)",
+                narrative["narrative_id"],
+                token["token_id"],
+                token_name,
+                result["method"],
+                result["confidence"],
             )
 
         return links
