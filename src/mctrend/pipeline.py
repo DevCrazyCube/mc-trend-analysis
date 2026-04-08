@@ -26,6 +26,7 @@ from mctrend.alerting.engine import AlertEngine
 from mctrend.correlation.linker import CorrelationEngine
 from mctrend.delivery.channels import DeliveryRouter
 from mctrend.ingestion.manager import IngestionManager
+from mctrend.ingestion.relevance import score_article_relevance, score_narrative_relevance
 from mctrend.narrative.intelligence import (
     NarrativeConfig,
     NarrativeIntelligence,
@@ -114,6 +115,19 @@ class Pipeline:
             )
         self.narrative_intel = NarrativeIntelligence(ni_cfg)
 
+        # Relevance filtering thresholds (from settings or defaults)
+        if settings and hasattr(settings, "narrative_intelligence"):
+            ni = settings.narrative_intelligence
+            self._articles_min_relevance = ni.articles_min_relevance_score
+            self._narratives_min_relevance = ni.narratives_min_relevance_score
+            self._relevance_positive_saturation = ni.relevance_positive_saturation
+            self._relevance_veto_override_threshold = ni.relevance_veto_override_threshold
+        else:
+            self._articles_min_relevance = 0.20
+            self._narratives_min_relevance = 0.15
+            self._relevance_positive_saturation = 1.5
+            self._relevance_veto_override_threshold = 0.15
+
         # Stats
         self._cycle_count = 0
         self._total_tokens_processed = 0
@@ -133,6 +147,10 @@ class Pipeline:
             "started_at": cycle_start.isoformat(),
             "tokens_ingested": 0,
             "events_ingested": 0,
+            "articles_fetched": 0,
+            "articles_rejected_irrelevant": 0,
+            "narratives_blocked_low_relevance": 0,
+            "source_cooldown_active": 0,
             "links_created": 0,
             "tokens_scored": 0,
             "alerts_created": 0,
@@ -152,12 +170,16 @@ class Pipeline:
                 self.gap_repo.open_gap(gap)
 
             now_iso = datetime.now(timezone.utc).isoformat()
+            cooldown_count = 0
             for source_name, meta in self.ingestion.get_source_health().items():
+                if meta.get("in_rate_limit_cooldown"):
+                    cooldown_count += 1
                 if meta.get("healthy"):
                     closed = self.gap_repo.close_open_gaps_for_source(source_name, now_iso)
                     if closed:
                         logger.info("source_gap_closed",
                                     source=source_name, gaps_closed=closed)
+            summary["source_cooldown_active"] = cooldown_count
         except Exception as e:
             logger.error("pipeline_ingest_error", error=str(e))
             summary["errors"].append(f"ingest: {e}")
@@ -183,8 +205,44 @@ class Pipeline:
         summary["tokens_ingested"] = len(new_tokens)
 
         # Step 3: Normalize and store events/narratives
-        new_events = []
+        # Step 3a: Article gate — filter raw events by relevance before normalization.
+        # Prevents irrelevant articles (sports, politics, entertainment) from becoming narratives.
+        summary["articles_fetched"] = len(raw_events)
+        articles_rejected = 0
+        filtered_events: list[dict] = []
         for raw in raw_events:
+            title = raw.get("_title") or raw.get("description", "")
+            description = raw.get("_description", "")
+            source_name_raw = raw.get("_source_name") or raw.get("source_name", "")
+            relevance = score_article_relevance(
+                title=title,
+                description=description,
+                source_name=source_name_raw,
+                positive_saturation=self._relevance_positive_saturation,
+                veto_override_threshold=self._relevance_veto_override_threshold,
+            )
+            if relevance >= self._articles_min_relevance:
+                filtered_events.append(raw)
+            else:
+                articles_rejected += 1
+                logger.debug(
+                    "article_rejected_irrelevant",
+                    title=title[:80],
+                    source=source_name_raw,
+                    relevance=round(relevance, 3),
+                    threshold=self._articles_min_relevance,
+                )
+        summary["articles_rejected_irrelevant"] = articles_rejected
+        if articles_rejected:
+            logger.info(
+                "article_gate_summary",
+                fetched=len(raw_events),
+                rejected=articles_rejected,
+                passed=len(filtered_events),
+            )
+
+        new_events = []
+        for raw in filtered_events:
             try:
                 normalized = normalize_event(raw)
                 if normalized is None:
@@ -295,7 +353,57 @@ class Pipeline:
         # Step 4: Correlate tokens with narratives
         # Use scoring-eligible narratives for correlation (EMERGING, RISING, TRENDING)
         try:
-            active_narratives = self.narrative_repo.get_for_scoring()
+            candidate_narratives = self.narrative_repo.get_for_scoring()
+
+            # Step 4a: Narrative relevance gate — block low-relevance narratives from
+            # token linking.  Computed from stored anchor_terms + description.
+            # This is separate from lifecycle state: a narrative can be TRENDING but
+            # semantically irrelevant (e.g., a sports event that accumulated sources).
+            narratives_blocked = 0
+            active_narratives = []
+            for narr in candidate_narratives:
+                anchor_terms = narr.get("anchor_terms") or []
+                if isinstance(anchor_terms, str):
+                    import json as _json
+                    try:
+                        anchor_terms = _json.loads(anchor_terms)
+                    except Exception:
+                        anchor_terms = []
+                sources = narr.get("sources") or []
+                if isinstance(sources, str):
+                    import json as _json
+                    try:
+                        sources = _json.loads(sources)
+                    except Exception:
+                        sources = []
+                source_names = [s.get("source_name", "") for s in sources if isinstance(s, dict)]
+                rel = score_narrative_relevance(
+                    anchor_terms=anchor_terms,
+                    description=narr.get("description", ""),
+                    source_names=source_names,
+                    positive_saturation=self._relevance_positive_saturation,
+                    veto_override_threshold=self._relevance_veto_override_threshold,
+                )
+                if rel >= self._narratives_min_relevance:
+                    active_narratives.append(narr)
+                else:
+                    narratives_blocked += 1
+                    logger.info(
+                        "narrative_blocked_low_relevance",
+                        narrative_id=narr.get("narrative_id"),
+                        description=str(narr.get("description", ""))[:60],
+                        relevance=round(rel, 3),
+                        threshold=self._narratives_min_relevance,
+                    )
+            summary["narratives_blocked_low_relevance"] = narratives_blocked
+            if narratives_blocked:
+                logger.info(
+                    "narrative_gate_summary",
+                    candidates=len(candidate_narratives),
+                    blocked=narratives_blocked,
+                    passed=len(active_narratives),
+                )
+
             tokens_to_correlate = self.token_repo.list_by_status("new", limit=200)
 
             links_created = 0

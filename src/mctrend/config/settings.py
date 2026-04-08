@@ -204,6 +204,24 @@ class NarrativeIntelligenceConfig(BaseModel):
         1, ge=1, description="Min distinct source types for a narrative"
     )
 
+    # Relevance filtering — article gate and narrative gate
+    articles_min_relevance_score: float = Field(
+        0.20, ge=0.0, le=1.0,
+        description="Minimum relevance score for a raw article to pass the article gate",
+    )
+    narratives_min_relevance_score: float = Field(
+        0.15, ge=0.0, le=1.0,
+        description="Minimum relevance score for a stored narrative to participate in token linking",
+    )
+    relevance_positive_saturation: float = Field(
+        1.5, gt=0.0,
+        description="Sum of positive term weights that yields relevance score of 1.0",
+    )
+    relevance_veto_override_threshold: float = Field(
+        0.15, ge=0.0, le=1.0,
+        description="Crypto signal above this prevents a veto category from suppressing the article",
+    )
+
     @model_validator(mode="after")
     def _strength_weights_sum(self) -> NarrativeIntelligenceConfig:
         total = (
@@ -451,14 +469,35 @@ class Settings(BaseModel):
 
     # -- Ingestion adapter parameters -----------------------------------------
     news_query_terms: list[str] = Field(
-        default_factory=lambda: ["crypto", "meme", "viral", "trending"],
-        description="Search query terms for NewsAPI adapter",
+        default_factory=lambda: [
+            "solana token launch",
+            "memecoin crypto",
+            "pump.fun token",
+            "crypto market token",
+        ],
+        description="Search query terms for NewsAPI adapter — narrow market-specific queries preferred over broad single words",
     )
     news_page_size: int = Field(
         10, gt=0, description="Articles per query for NewsAPI adapter"
     )
     news_signal_strength: float = Field(
         0.6, ge=0.0, le=1.0, description="Default signal strength for news events"
+    )
+    newsapi_domains: str = Field(
+        "",
+        description="Comma-separated list of news domains to restrict NewsAPI results (e.g. 'coindesk.com,cointelegraph.com'). Empty = no restriction.",
+    )
+    newsapi_rate_limit_cooldown_after: int = Field(
+        2, ge=1,
+        description="Number of consecutive 429 responses before entering rate-limit cooldown",
+    )
+    newsapi_rate_limit_cooldown_seconds: float = Field(
+        60.0, gt=0,
+        description="Base cooldown duration in seconds after hitting the 429 threshold",
+    )
+    newsapi_rate_limit_max_cooldown_seconds: float = Field(
+        900.0, gt=0,
+        description="Maximum cooldown duration in seconds (caps exponential growth)",
     )
     trends_geo: str = Field("US", description="Geographic filter for Google Trends adapter")
     trends_signal_strength: float = Field(

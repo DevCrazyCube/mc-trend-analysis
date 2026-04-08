@@ -1,13 +1,24 @@
 """News source adapter for narrative detection."""
+import time
 import httpx
 from datetime import datetime, timezone
 from .base import SourceAdapter, logger, retry_fetch
 
-_DEFAULT_QUERY_TERMS = ["crypto", "meme", "viral", "trending"]
+_DEFAULT_QUERY_TERMS = [
+    "solana token launch",
+    "memecoin crypto",
+    "pump.fun token",
+    "crypto market token",
+]
 
 
 class NewsAPIAdapter(SourceAdapter):
-    """Fetch trending news from NewsAPI.org for narrative detection."""
+    """Fetch trending news from NewsAPI.org for narrative detection.
+
+    Includes per-source rate-limit cooldown: after ``cooldown_after`` consecutive
+    HTTP 429 responses the adapter stops making requests for ``cooldown_seconds``
+    (with exponential backoff per episode, capped at ``max_cooldown_seconds``).
+    """
 
     def __init__(
         self,
@@ -16,6 +27,10 @@ class NewsAPIAdapter(SourceAdapter):
         query_terms: list[str] | None = None,
         page_size: int = 10,
         signal_strength: float = 0.6,
+        domains: str = "",
+        cooldown_after: int = 2,
+        cooldown_seconds: float = 60.0,
+        max_cooldown_seconds: float = 900.0,
     ):
         super().__init__(source_name="newsapi", source_type="news")
         self.api_key = api_key
@@ -24,17 +39,48 @@ class NewsAPIAdapter(SourceAdapter):
         self.query_terms = query_terms or _DEFAULT_QUERY_TERMS
         self.page_size = page_size
         self.signal_strength = signal_strength
+        self.domains = domains  # comma-separated domain filter (e.g. "coindesk.com")
+
+        # Rate-limit cooldown state
+        self._cooldown_after = cooldown_after
+        self._cooldown_seconds = cooldown_seconds
+        self._max_cooldown_seconds = max_cooldown_seconds
+        self._consecutive_429s = 0
+        self._cooldown_episodes = 0       # number of cooldown periods entered
+        self._cooldown_until: float = 0.0  # monotonic timestamp; 0 = not in cooldown
+
         self._client: httpx.AsyncClient | None = None
 
-    async def _get_client(self):
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
-        return self._client
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def is_in_cooldown(self) -> bool:
+        """Return True if the adapter is currently in rate-limit cooldown."""
+        return time.monotonic() < self._cooldown_until
+
+    def get_source_meta(self) -> dict:
+        meta = super().get_source_meta()
+        meta["in_rate_limit_cooldown"] = self.is_in_cooldown()
+        meta["consecutive_429s"] = self._consecutive_429s
+        remaining = max(0.0, self._cooldown_until - time.monotonic())
+        meta["cooldown_remaining_seconds"] = round(remaining, 1) if remaining > 0 else 0.0
+        return meta
 
     async def fetch(self) -> list[dict]:
         """Fetch top headlines and trending crypto/tech news."""
         if not self.api_key:
             logger.debug("newsapi_skipped_no_key")
+            return []
+
+        # Honour rate-limit cooldown: skip fetch silently during cooldown period
+        if self.is_in_cooldown():
+            remaining = round(self._cooldown_until - time.monotonic(), 1)
+            logger.info(
+                "newsapi_cooldown_active",
+                cooldown_remaining_seconds=remaining,
+                consecutive_429s=self._consecutive_429s,
+            )
             return []
 
         try:
@@ -43,29 +89,34 @@ class NewsAPIAdapter(SourceAdapter):
 
             for query in self.query_terms:
                 async def _do_fetch(q=query):
-                    r = await client.get(
-                        f"{self.base_url}/everything",
-                        params={"q": q, "sortBy": "publishedAt",
-                                "pageSize": self.page_size, "language": "en",
-                                "apiKey": self.api_key},
-                    )
+                    params = {
+                        "q": q,
+                        "sortBy": "publishedAt",
+                        "pageSize": self.page_size,
+                        "language": "en",
+                        "apiKey": self.api_key,
+                    }
+                    if self.domains:
+                        params["domains"] = self.domains
+                    r = await client.get(f"{self.base_url}/everything", params=params)
                     r.raise_for_status()
                     return r.json().get("articles", [])
 
                 articles = await retry_fetch(_do_fetch, self.source_name)
                 all_articles.extend(articles)
 
+            # Successful fetch: reset 429 counter
+            self._consecutive_429s = 0
             self._mark_healthy()
 
             # Normalize and deduplicate by title
             events = []
-            seen_titles = set()
+            seen_titles: set[str] = set()
             for article in all_articles:
                 title = article.get("title", "")
                 if title in seen_titles or not title:
                     continue
                 seen_titles.add(title)
-
                 event = self._normalize_article(article)
                 if event:
                     events.append(event)
@@ -73,10 +124,48 @@ class NewsAPIAdapter(SourceAdapter):
             logger.info("newsapi_fetch_complete", article_count=len(events))
             return events
 
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                self._handle_429()
+            else:
+                self._mark_unhealthy(str(e))
+                logger.error("newsapi_fetch_failed", status=e.response.status_code, error=str(e))
+            return []
         except Exception as e:
             self._mark_unhealthy(str(e))
             logger.error("newsapi_fetch_failed", error=str(e))
             return []
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _handle_429(self) -> None:
+        """Record a 429 response and enter cooldown if threshold is reached."""
+        self._consecutive_429s += 1
+        self._mark_unhealthy("HTTP 429 Too Many Requests")
+        logger.warning(
+            "newsapi_rate_limited",
+            consecutive_429s=self._consecutive_429s,
+            cooldown_after=self._cooldown_after,
+        )
+        if self._consecutive_429s >= self._cooldown_after:
+            self._cooldown_episodes += 1
+            duration = min(
+                self._cooldown_seconds * (2 ** (self._cooldown_episodes - 1)),
+                self._max_cooldown_seconds,
+            )
+            self._cooldown_until = time.monotonic() + duration
+            logger.warning(
+                "newsapi_entering_cooldown",
+                cooldown_seconds=round(duration, 1),
+                cooldown_episode=self._cooldown_episodes,
+            )
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
 
     def _normalize_article(self, article: dict) -> dict | None:
         """Convert news article to event signal dict."""
@@ -106,6 +195,10 @@ class NewsAPIAdapter(SourceAdapter):
                 "published_at": published.isoformat(),
                 "url": article.get("url"),
                 "raw_text": f"{title} {description}",
+                # Pass raw title+description for relevance scoring in the pipeline
+                "_title": title,
+                "_description": description,
+                "_source_name": source_name,
             }
         except Exception as e:
             logger.warning("newsapi_normalize_failed", error=str(e))
@@ -136,7 +229,7 @@ class NewsAPIAdapter(SourceAdapter):
             if len(clean) >= 2 and clean.lower() not in stop_words:
                 terms.append(clean.upper())
 
-        seen = set()
+        seen: set[str] = set()
         unique = []
         for t in terms:
             if t not in seen:
@@ -145,6 +238,6 @@ class NewsAPIAdapter(SourceAdapter):
 
         return unique
 
-    async def close(self):
+    async def close(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()

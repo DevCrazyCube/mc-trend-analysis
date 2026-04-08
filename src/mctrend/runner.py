@@ -260,6 +260,10 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
                     query_terms=settings.news_query_terms,
                     page_size=settings.news_page_size,
                     signal_strength=settings.news_signal_strength,
+                    domains=settings.newsapi_domains,
+                    cooldown_after=settings.newsapi_rate_limit_cooldown_after,
+                    cooldown_seconds=settings.newsapi_rate_limit_cooldown_seconds,
+                    max_cooldown_seconds=settings.newsapi_rate_limit_max_cooldown_seconds,
                 )
             )
 
@@ -324,30 +328,31 @@ def inject_demo_data(pipeline: Pipeline):
 
     logger.info("injecting_demo_data")
 
-    # Create some narratives
+    # Create some crypto-relevant narratives that will pass the relevance gate.
+    # These represent realistic memecoin/market scenarios on Pump.fun / Solana.
     narratives = [
         {
-            "anchor_terms": ["DEEPMIND", "GOOGLE", "AI"],
-            "related_terms": ["GEMINI", "ARTIFICIAL", "INTELLIGENCE"],
-            "description": "Google DeepMind announces major AI breakthrough",
+            "anchor_terms": ["SOLANA", "MEMECOIN", "PUMP"],
+            "related_terms": ["TOKEN", "LAUNCH", "DEGEN", "LIQUIDITY"],
+            "description": "Solana memecoin pump.fun token launch surge",
             "source_type": "news",
             "source_name": "demo_news",
             "signal_strength": 0.85,
             "published_at": now.isoformat(),
         },
         {
-            "anchor_terms": ["MOONDOG", "SPACE", "DOG"],
-            "related_terms": ["BALLOON", "NASA", "VIRAL"],
-            "description": "Viral video of dog in space balloon experiment",
+            "anchor_terms": ["MOONDOG", "TOKEN", "SOLANA"],
+            "related_terms": ["MEMECOIN", "HOLDER", "WALLET", "DEGEN"],
+            "description": "MOONDOG token gaining traction on Solana with growing holder count",
             "source_type": "search_trends",
             "source_name": "demo_trends",
             "signal_strength": 0.78,
             "published_at": now.isoformat(),
         },
         {
-            "anchor_terms": ["BRAVADO", "BOXING", "CHAMPION"],
-            "related_terms": ["FIGHT", "KNOCKOUT", "VIRAL"],
-            "description": "Boxing championship viral victory moment",
+            "anchor_terms": ["BRAVADO", "CRYPTO", "TOKEN"],
+            "related_terms": ["PUMP", "MEMECOIN", "SOLANA", "MARKET"],
+            "description": "BRAVADO crypto token trending on pump.fun",
             "source_type": "news",
             "source_name": "demo_news",
             "signal_strength": 0.72,
@@ -360,21 +365,21 @@ def inject_demo_data(pipeline: Pipeline):
     confirmations = [
         # Second sources
         {
-            "anchor_terms": ["DEEPMIND", "GOOGLE", "AI"],
+            "anchor_terms": ["SOLANA", "MEMECOIN", "PUMP"],
             "source_type": "search_trends",
             "source_name": "demo_trends",
             "signal_strength": 0.80,
             "published_at": now.isoformat(),
         },
         {
-            "anchor_terms": ["MOONDOG", "SPACE", "DOG"],
+            "anchor_terms": ["MOONDOG", "TOKEN", "SOLANA"],
             "source_type": "news",
             "source_name": "demo_news",
             "signal_strength": 0.75,
             "published_at": now.isoformat(),
         },
         {
-            "anchor_terms": ["BRAVADO", "BOXING", "CHAMPION"],
+            "anchor_terms": ["BRAVADO", "CRYPTO", "TOKEN"],
             "source_type": "search_trends",
             "source_name": "demo_trends",
             "signal_strength": 0.70,
@@ -382,21 +387,21 @@ def inject_demo_data(pipeline: Pipeline):
         },
         # Third sources (different type for diversity boost)
         {
-            "anchor_terms": ["DEEPMIND", "GOOGLE", "AI"],
+            "anchor_terms": ["SOLANA", "MEMECOIN", "PUMP"],
             "source_type": "twitter",
             "source_name": "demo_twitter",
             "signal_strength": 0.82,
             "published_at": now.isoformat(),
         },
         {
-            "anchor_terms": ["MOONDOG", "SPACE", "DOG"],
+            "anchor_terms": ["MOONDOG", "TOKEN", "SOLANA"],
             "source_type": "twitter",
             "source_name": "demo_twitter",
             "signal_strength": 0.77,
             "published_at": now.isoformat(),
         },
         {
-            "anchor_terms": ["BRAVADO", "BOXING", "CHAMPION"],
+            "anchor_terms": ["BRAVADO", "CRYPTO", "TOKEN"],
             "source_type": "twitter",
             "source_name": "demo_twitter",
             "signal_strength": 0.68,
@@ -437,9 +442,9 @@ def inject_demo_data(pipeline: Pipeline):
     tokens = [
         {
             "address": "DEMO1111111111111111111111111111111111111111",
-            "name": "DEEPMIND",
-            "symbol": "DEEPMIND",
-            "description": "The original DeepMind token",
+            "name": "SOLPUMP",
+            "symbol": "SOLPUMP",
+            "description": "The original Solana pump token",
             "deployed_by": "DemoDeployer1111111111111111111111111111111",
             "launch_time": (now - timedelta(minutes=8)).isoformat(),
             "launch_platform": "pump.fun",
@@ -449,9 +454,9 @@ def inject_demo_data(pipeline: Pipeline):
         },
         {
             "address": "DEMO2222222222222222222222222222222222222222",
-            "name": "DMIND",
-            "symbol": "DMIND",
-            "description": "DeepMind copycat",
+            "name": "SOLMEME",
+            "symbol": "SOLMEME",
+            "description": "Solana memecoin copycat",
             "deployed_by": "DemoDeployer2222222222222222222222222222222",
             "launch_time": (now - timedelta(minutes=3)).isoformat(),
             "launch_platform": "pump.fun",
@@ -463,7 +468,7 @@ def inject_demo_data(pipeline: Pipeline):
             "address": "DEMO3333333333333333333333333333333333333333",
             "name": "MOONDOG",
             "symbol": "MOONDOG",
-            "description": "To the moon, dog!",
+            "description": "MOONDOG Solana token",
             "deployed_by": "DemoDeployer3333333333333333333333333333333",
             "launch_time": (now - timedelta(minutes=11)).isoformat(),
             "launch_platform": "pump.fun",
@@ -475,7 +480,7 @@ def inject_demo_data(pipeline: Pipeline):
             "address": "DEMO4444444444444444444444444444444444444444",
             "name": "BRAVADO",
             "symbol": "BRAVADO",
-            "description": "Victory moment token",
+            "description": "BRAVADO crypto token",
             "deployed_by": "BadDeployer444444444444444444444444444444444",
             "launch_time": (now - timedelta(minutes=5)).isoformat(),
             "launch_platform": "pump.fun",
@@ -494,7 +499,7 @@ def inject_demo_data(pipeline: Pipeline):
     import uuid
 
     snapshots = [
-        {  # DEEPMIND - moderate risk
+        {  # SOLPUMP - moderate risk
             "token_id_lookup": "DEMO1111111111111111111111111111111111111111",
             "holder_count": 47,
             "top_5_holder_pct": 0.41,
