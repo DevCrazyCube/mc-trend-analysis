@@ -5,23 +5,25 @@ from .base import SourceAdapter, logger, retry_fetch
 
 
 class PumpFunAdapter(SourceAdapter):
-    """Fetches new token launches from Pump.fun API.
+    """Fetches new token launches from a Pump.fun-compatible token listing API.
 
-    NOTE: The public Pump.fun frontend API (``frontend-api-v2.pump.fun``) has
-    no documented SLA and returns 503 frequently in production.  This adapter
-    is structurally correct but depends on an unreliable public endpoint.
+    NOTE: The default public endpoint (``frontend-api-v2.pump.fun``) is
+    non-functional — it returns 503 persistently (not intermittently).  This
+    adapter is **only registered** when ``PUMPFUN_API_URL`` is explicitly set
+    to a working token listing REST API.
 
-    Status label: ``enabled-unreliable`` — adapter is registered and attempts
-    fetches, but failures are expected and do not indicate a system bug.
-    Set ``PUMPFUN_API_URL`` to override with a private/paid endpoint.
+    The configured URL must serve a JSON array of token objects at
+    ``<URL>/coins``.  It must be a token *listing* endpoint — not a trade
+    execution endpoint (e.g. ``pumpportal.fun/api/trade`` returns 403 and is
+    categorically wrong for this use case).
     """
 
-    #: Public endpoint is functional but unreliable (no SLA, frequent 503).
     SUPPORTED = True
     RELIABILITY_NOTE = (
-        "Public endpoint frontend-api-v2.pump.fun has no SLA and returns 503 "
-        "intermittently. Failures are expected. Set PUMPFUN_API_URL to use a "
-        "private or paid endpoint."
+        "Default public endpoint (frontend-api-v2.pump.fun) is non-functional "
+        "(persistent 503). This adapter is only registered when PUMPFUN_API_URL "
+        "is explicitly set to a working token listing REST API. "
+        "The URL must serve a JSON array at <URL>/coins."
     )
 
     def __init__(self, api_url: str | None = None, timeout: float = 10.0,

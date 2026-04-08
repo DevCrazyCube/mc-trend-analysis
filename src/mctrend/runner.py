@@ -67,8 +67,14 @@ def _source_status_map(settings: Settings, demo_mode: bool) -> dict[str, str]:
         status["newsapi"] = "demo-disabled"
         status["serpapi_trends"] = "demo-disabled"
     else:
-        # pump.fun — enabled but publicly unreliable
-        status["pump.fun"] = "enabled-unreliable"
+        # pump.fun — only registered when PUMPFUN_API_URL is explicitly set
+        if settings.pumpfun_api_url:
+            status["pump.fun"] = "enabled-unreliable"
+        else:
+            status["pump.fun"] = (
+                "unsupported (default endpoint non-functional — "
+                "set PUMPFUN_API_URL to a token listing REST API)"
+            )
         # solana_rpc — enabled (public RPC, rate-limited but usable)
         status["solana_rpc"] = "enabled"
         # newsapi
@@ -166,7 +172,8 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
     else:
         # Live adapters — register in order of reliability.
 
-        # Pump.fun: public endpoint, no SLA.  Failures are expected.
+        # Pump.fun: only register when an explicit URL is configured.
+        # The default public endpoint is non-functional (persistent 503).
         if settings.pumpfun_api_url:
             ingestion.register_token_adapter(
                 PumpFunAdapter(
@@ -176,11 +183,13 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
                 )
             )
         else:
-            ingestion.register_token_adapter(
-                PumpFunAdapter(
-                    timeout=settings.external_api_timeout_seconds,
-                    fetch_limit=settings.pumpfun_fetch_limit,
-                )
+            logger.warning(
+                "live_token_discovery_unavailable",
+                reason=(
+                    "PUMPFUN_API_URL is not set and the default public endpoint is "
+                    "non-functional. Set PUMPFUN_API_URL to a working token listing "
+                    "REST API to enable token ingestion."
+                ),
             )
 
         # SolanaRPC — for on-chain enrichment; public endpoint, rate-limited.
