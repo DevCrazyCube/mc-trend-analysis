@@ -126,7 +126,7 @@ def normalize_event(raw: dict) -> dict | None:
         "entities": raw.get("entities", []),
         "description": raw.get("description", " ".join(anchor_terms[:3])),
         "attention_score": _safe_float(raw.get("signal_strength")) or 0.5,
-        "narrative_velocity": 0.0,
+        "narrative_velocity": None,   # Unknown at ingestion time; scoring uses conservative default (0.4)
         "source_type_count": 1,
         "state": "EMERGING",
         "sources": [source],

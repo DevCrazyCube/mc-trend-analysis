@@ -77,8 +77,12 @@ def _source_status_map(settings: Settings, demo_mode: bool) -> dict[str, str]:
             status["pumpportal_ws"] = (
                 "disabled (set PUMPPORTAL_WS_ENABLED=true to enable real-time discovery)"
             )
-        # pump.fun REST — only registered when PUMPFUN_API_URL is explicitly set
-        if settings.pumpfun_api_url:
+        # pump.fun REST — disabled when WS is active; only registered when WS is off
+        if settings.pumpportal_ws_enabled:
+            status["pump.fun"] = (
+                "disabled (WebSocket discovery is primary; REST adapter not registered)"
+            )
+        elif settings.pumpfun_api_url:
             status["pump.fun"] = "enabled-unreliable"
         else:
             status["pump.fun"] = (
@@ -212,15 +216,22 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
                 hint="Set PUMPPORTAL_WS_ENABLED=true to enable real-time token discovery",
             )
 
-        # Pump.fun REST: only register when an explicit URL is configured.
-        # The default public endpoint is non-functional (persistent 503).
-        if settings.pumpfun_api_url:
+        # Pump.fun REST: disabled when WebSocket discovery is active.
+        # When PUMPPORTAL_WS_ENABLED=true, WebSocket is the primary discovery path.
+        # Registering the REST adapter alongside it would produce 403 noise
+        # since the public pumpportal.fun REST endpoint is non-functional.
+        if settings.pumpfun_api_url and not settings.pumpportal_ws_enabled:
             ingestion.register_token_adapter(
                 PumpFunAdapter(
                     api_url=settings.pumpfun_api_url,
                     timeout=settings.external_api_timeout_seconds,
                     fetch_limit=settings.pumpfun_fetch_limit,
                 )
+            )
+        elif settings.pumpfun_api_url and settings.pumpportal_ws_enabled:
+            logger.info(
+                "pumpfun_rest_skipped_ws_active",
+                reason="WebSocket discovery is enabled; REST token adapter not registered.",
             )
         elif not settings.pumpportal_ws_enabled:
             # Neither WS nor REST discovery is configured
