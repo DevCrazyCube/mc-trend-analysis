@@ -248,6 +248,65 @@ AlertDelivery
 
 ---
 
+### Entity: RejectedCandidate
+
+A diagnostic record capturing the most recent scoring result for a token-narrative pair that was classified as "ignore" (i.e., failed to produce any alert).  Used by the operator dashboard to understand why tokens are not alerting, and to tune thresholds.
+
+**Primary key:** `(token_id, narrative_id)` — compound key.  Each re-score replaces the previous row via INSERT OR REPLACE.  There is at most one row per token-narrative pair at any time.
+
+```
+RejectedCandidate
+  token_id: uuid (FK → Token)
+  narrative_id: uuid (FK → Narrative)
+  token_name: string
+  token_symbol: string
+  narrative_name: string
+  score_id: uuid (FK → ScoredToken)
+  alert_type: "ignore"
+  net_potential: float
+  p_potential: float
+  p_failure: float
+  confidence_score: float
+  watch_gap: float          — watch_min_net_potential - net_potential (positive = below threshold)
+  rejection_reasons: list[RejectionReason]
+  dimension_scores: dict
+  risk_flags: list[string]
+  data_gaps: list[string]
+  rejected_at: datetime
+```
+
+**RejectionReason structure:**
+```
+  code: string              — machine-readable (e.g., "net_potential_below_watch")
+  tier: string              — alert tier this reason blocked
+  actual: float | string    — the actual value
+  threshold: float | string — the required threshold
+  gap: float | null         — distance from meeting the condition (positive = needs to increase)
+```
+
+**Known reason codes:**
+
+| code | tier | meaning |
+|---|---|---|
+| `net_potential_below_watch` | watch | net_potential < 0.25 |
+| `net_potential_below_verify` | verify | net_potential < 0.35 |
+| `net_potential_below_hpw` | high_potential_watch | net_potential < 0.45 |
+| `net_potential_below_pe` | possible_entry | net_potential < 0.60 |
+| `p_failure_too_high_for_hpw` | high_potential_watch | p_failure >= 0.50 |
+| `p_failure_too_high_for_pe` | possible_entry | p_failure >= 0.30 |
+| `confidence_below_hpw_floor` | high_potential_watch | confidence < 0.55 |
+| `confidence_below_pe_floor` | possible_entry | confidence < 0.65 |
+| `narrative_state_not_active` | high_potential_watch\|possible_entry | narrative not EMERGING or PEAKING |
+| `blocking_flag_caps_at_verify` | possible_entry\|high_potential_watch | critical risk flag present |
+| `discard_flag_active` | all | known-bad deployer or equivalent |
+| `missing_required_enrichment` | rug_risk_dimension | specific chain data gap (holder_concentration, liquidity_data, etc.) |
+
+**Retention:** 48 hours (pruned each pipeline cycle).  This is diagnostic data, not calibration data.
+
+**API:** `GET /api/candidates?limit=N` — returns rows sorted by `watch_gap ASC` (closest to alert threshold first).
+
+---
+
 ### Entity: SourceGap
 
 A log entry recording when a data source was unavailable.
@@ -275,7 +334,8 @@ Narrative ───────────────────────�
 Token ──────────────── TokenChainSnapshot (many, time series)
   │
   └── TokenNarrativeLink ─────── ScoredToken (many, one per scoring run)
-            │
+            │                             │
+            │                             └── RejectedCandidate (one, most recent ignore)
             └── Alert ─────────── AlertDelivery (many)
 ```
 
@@ -304,5 +364,6 @@ Token ──────────────── TokenChainSnapshot (many,
 | Alert | Indefinite (calibration data) |
 | AlertDelivery | 90 days |
 | SourceGap | 90 days |
+| RejectedCandidate | 48 hours (diagnostic data only; compound PK keeps one row per token-narrative pair) |
 
 Retention policies are initial defaults and should be revisited as storage costs grow.

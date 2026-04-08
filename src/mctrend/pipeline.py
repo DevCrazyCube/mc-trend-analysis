@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from mctrend.alerting.classifier import explain_rejection
 from mctrend.alerting.engine import AlertEngine
 from mctrend.correlation.linker import CorrelationEngine
 from mctrend.delivery.channels import DeliveryRouter
@@ -35,6 +36,7 @@ from mctrend.persistence.repositories import (
     AlertRepository,
     LinkRepository,
     NarrativeRepository,
+    RejectedCandidateRepository,
     ScoringRepository,
     SourceGapRepository,
     TokenRepository,
@@ -75,6 +77,7 @@ class Pipeline:
         self.scoring_repo = ScoringRepository(db)
         self.alert_repo = AlertRepository(db)
         self.gap_repo = SourceGapRepository(db)
+        self.rejected_repo = RejectedCandidateRepository(db)
 
         # Stats
         self._cycle_count = 0
@@ -286,6 +289,11 @@ class Pipeline:
                         summary["alerts_delivered"] += sum(
                             1 for l in logs if l.get("status") == "delivered"
                         )
+                    else:
+                        # Token was classified as 'ignore' with no prior alert.
+                        # Log and persist structured rejection reasons so the
+                        # dashboard can show why scored tokens are not alerting.
+                        self._handle_rejection(scored, token, narrative)
 
                 except Exception as e:
                     logger.error(
@@ -349,10 +357,17 @@ class Pipeline:
 
             pruned_snaps = self.token_repo.prune_old_snapshots(snap_cutoff.isoformat())
             pruned_scores = self.scoring_repo.prune_old_scored_tokens(score_cutoff.isoformat())
-            total_pruned = pruned_snaps + pruned_scores
+
+            # Prune rejected candidates older than 48h (they are diagnostic data,
+            # not calibration data; compound PK keeps one row per pair anyway).
+            rejected_cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+            pruned_rejected = self.rejected_repo.prune_old(rejected_cutoff.isoformat())
+
+            total_pruned = pruned_snaps + pruned_scores + pruned_rejected
             if total_pruned:
                 logger.info("data_pruned",
-                            snapshots=pruned_snaps, scored_tokens=pruned_scores)
+                            snapshots=pruned_snaps, scored_tokens=pruned_scores,
+                            rejected_candidates=pruned_rejected)
             summary["rows_pruned"] = total_pruned
         except Exception as e:
             logger.error("pipeline_pruning_error", error=str(e))
@@ -378,6 +393,90 @@ class Pipeline:
         }
 
     # --- Data building helpers ---
+
+    def _handle_rejection(
+        self,
+        scored: dict,
+        token: dict,
+        narrative: dict,
+    ) -> None:
+        """Log and persist a structured rejection record for a token classified as ignore.
+
+        Called when process_scored_token returns None (alert_type == "ignore",
+        no prior alert).  Produces a per-tier breakdown of which thresholds were
+        not met so the operator can tune thresholds instead of guessing.
+        """
+        net_potential = scored.get("net_potential", 0.0) or 0.0
+        p_potential = scored.get("p_potential", 0.0) or 0.0
+        p_failure = scored.get("p_failure", 0.0) or 0.0
+        confidence = scored.get("confidence_score", 0.0) or 0.0
+        risk_flags = scored.get("risk_flags") or []
+        data_gaps = scored.get("data_gaps") or []
+        narrative_state = narrative.get("state", "EMERGING")
+        watch_min = self.alert_engine.thresholds.watch_min_net_potential
+
+        reasons = explain_rejection(
+            net_potential=net_potential,
+            p_potential=p_potential,
+            p_failure=p_failure,
+            confidence=confidence,
+            risk_flags=risk_flags,
+            narrative_state=narrative_state,
+            data_gaps=data_gaps,
+            thresholds=self.alert_engine.thresholds,
+        )
+
+        watch_gap = round(watch_min - net_potential, 4)
+
+        # Structured log — one line per rejected token, visible in pipeline output
+        logger.info(
+            "token_rejected_no_alert",
+            token_id=token.get("token_id"),
+            token_name=token.get("name"),
+            token_symbol=token.get("symbol"),
+            narrative_id=narrative.get("narrative_id"),
+            narrative_name=narrative.get("description", narrative.get("name")),
+            narrative_state=narrative_state,
+            net_potential=net_potential,
+            p_potential=p_potential,
+            p_failure=p_failure,
+            confidence=confidence,
+            watch_gap=watch_gap,
+            rejection_reasons=[r["code"] for r in reasons],
+            data_gaps=data_gaps,
+        )
+
+        # Persist to rejected_candidates table for dashboard display
+        try:
+            candidate = {
+                "token_id": token["token_id"],
+                "narrative_id": narrative["narrative_id"],
+                "token_name": token.get("name"),
+                "token_symbol": token.get("symbol"),
+                "narrative_name": narrative.get("description", narrative.get("name")),
+                "score_id": scored.get("score_id"),
+                "alert_type": "ignore",
+                "net_potential": net_potential,
+                "p_potential": p_potential,
+                "p_failure": p_failure,
+                "confidence_score": confidence,
+                "watch_gap": watch_gap,
+                "rejection_reasons": reasons,
+                "dimension_scores": {
+                    "narrative_relevance": scored.get("narrative_relevance"),
+                    "og_score": scored.get("og_score"),
+                    "rug_risk": scored.get("rug_risk"),
+                    "momentum_quality": scored.get("momentum_quality"),
+                    "attention_strength": scored.get("attention_strength"),
+                    "timing_quality": scored.get("timing_quality"),
+                },
+                "risk_flags": risk_flags,
+                "data_gaps": data_gaps,
+                "rejected_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.rejected_repo.save(candidate)
+        except Exception as e:
+            logger.error("rejected_candidate_persist_error", error=str(e))
 
     def _find_matching_narrative(self, anchor_terms: list[str]) -> dict | None:
         """Find an existing narrative that shares anchor terms."""

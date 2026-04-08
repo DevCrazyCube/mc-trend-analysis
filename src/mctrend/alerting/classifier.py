@@ -53,6 +53,167 @@ _ACTIVE_NARRATIVE_STATES = {"EMERGING", "PEAKING"}
 _TAKE_PROFIT_NARRATIVE_STATES = {"PEAKING", "DECLINING"}
 
 
+def explain_rejection(
+    net_potential: float,
+    p_potential: float,
+    p_failure: float,
+    confidence: float,
+    risk_flags: list[str],
+    narrative_state: str = "EMERGING",
+    data_gaps: list[str] | None = None,
+    thresholds: AlertThresholds | None = None,
+) -> list[dict]:
+    """
+    Return a structured list of reasons why a scored token did not reach each
+    alert tier.  Intended for diagnostic logging and the dashboard rejection view.
+
+    Each entry is a dict:
+      code       — machine-readable reason code
+      tier       — the alert tier this reason blocked
+      actual     — the actual value (float or str; None for flag-based reasons)
+      threshold  — the required threshold (float or str; None for flag-based)
+      gap        — how far away from meeting the condition (positive = needs to
+                   increase; None for non-numeric reasons)
+
+    Only reasons that are actually failing are included.  A token that easily
+    passes a tier will not generate reasons for that tier.
+    """
+    if thresholds is None:
+        thresholds = AlertThresholds()
+
+    reasons: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Flag-based blockers (always shown when present)
+    # ------------------------------------------------------------------
+    for flag in risk_flags:
+        if flag in thresholds.discard_flags:
+            reasons.append({
+                "code": "discard_flag_active",
+                "tier": "all",
+                "actual": flag,
+                "threshold": None,
+                "gap": None,
+            })
+
+    blocking_flags_present = [f for f in risk_flags if f in thresholds.blocking_flags]
+    if blocking_flags_present:
+        reasons.append({
+            "code": "blocking_flag_caps_at_verify",
+            "tier": "possible_entry|high_potential_watch",
+            "actual": ",".join(blocking_flags_present),
+            "threshold": None,
+            "gap": None,
+        })
+
+    # ------------------------------------------------------------------
+    # Missing enrichment (data gaps)
+    # ------------------------------------------------------------------
+    _ENRICHMENT_GAPS = {
+        "holder_concentration", "liquidity_data", "wallet_clustering",
+        "deployer_history", "contract_authorities",
+    }
+    for gap in (data_gaps or []):
+        if gap in _ENRICHMENT_GAPS:
+            reasons.append({
+                "code": "missing_required_enrichment",
+                "tier": "rug_risk_dimension",
+                "actual": gap,
+                "threshold": None,
+                "gap": None,
+            })
+
+    # ------------------------------------------------------------------
+    # watch tier (net_potential >= 0.25)
+    # ------------------------------------------------------------------
+    if net_potential < thresholds.watch_min_net_potential:
+        reasons.append({
+            "code": "net_potential_below_watch",
+            "tier": "watch",
+            "actual": round(net_potential, 4),
+            "threshold": thresholds.watch_min_net_potential,
+            "gap": round(thresholds.watch_min_net_potential - net_potential, 4),
+        })
+
+    # ------------------------------------------------------------------
+    # verify tier (net_potential >= 0.35 AND confidence < 0.55)
+    # ------------------------------------------------------------------
+    if net_potential < thresholds.verify_min_net_potential:
+        reasons.append({
+            "code": "net_potential_below_verify",
+            "tier": "verify",
+            "actual": round(net_potential, 4),
+            "threshold": thresholds.verify_min_net_potential,
+            "gap": round(thresholds.verify_min_net_potential - net_potential, 4),
+        })
+
+    # ------------------------------------------------------------------
+    # high_potential_watch tier
+    # ------------------------------------------------------------------
+    if net_potential < thresholds.hpw_min_net_potential:
+        reasons.append({
+            "code": "net_potential_below_hpw",
+            "tier": "high_potential_watch",
+            "actual": round(net_potential, 4),
+            "threshold": thresholds.hpw_min_net_potential,
+            "gap": round(thresholds.hpw_min_net_potential - net_potential, 4),
+        })
+    if p_failure >= thresholds.hpw_max_p_failure:
+        reasons.append({
+            "code": "p_failure_too_high_for_hpw",
+            "tier": "high_potential_watch",
+            "actual": round(p_failure, 4),
+            "threshold": thresholds.hpw_max_p_failure,
+            "gap": round(p_failure - thresholds.hpw_max_p_failure, 4),
+        })
+    if confidence < thresholds.hpw_min_confidence:
+        reasons.append({
+            "code": "confidence_below_hpw_floor",
+            "tier": "high_potential_watch",
+            "actual": round(confidence, 4),
+            "threshold": thresholds.hpw_min_confidence,
+            "gap": round(thresholds.hpw_min_confidence - confidence, 4),
+        })
+    if narrative_state not in _ACTIVE_NARRATIVE_STATES:
+        reasons.append({
+            "code": "narrative_state_not_active",
+            "tier": "high_potential_watch|possible_entry",
+            "actual": narrative_state,
+            "threshold": "|".join(sorted(_ACTIVE_NARRATIVE_STATES)),
+            "gap": None,
+        })
+
+    # ------------------------------------------------------------------
+    # possible_entry tier
+    # ------------------------------------------------------------------
+    if net_potential < thresholds.pe_min_net_potential:
+        reasons.append({
+            "code": "net_potential_below_pe",
+            "tier": "possible_entry",
+            "actual": round(net_potential, 4),
+            "threshold": thresholds.pe_min_net_potential,
+            "gap": round(thresholds.pe_min_net_potential - net_potential, 4),
+        })
+    if p_failure >= thresholds.pe_max_p_failure:
+        reasons.append({
+            "code": "p_failure_too_high_for_pe",
+            "tier": "possible_entry",
+            "actual": round(p_failure, 4),
+            "threshold": thresholds.pe_max_p_failure,
+            "gap": round(p_failure - thresholds.pe_max_p_failure, 4),
+        })
+    if confidence < thresholds.pe_min_confidence:
+        reasons.append({
+            "code": "confidence_below_pe_floor",
+            "tier": "possible_entry",
+            "actual": round(confidence, 4),
+            "threshold": thresholds.pe_min_confidence,
+            "gap": round(thresholds.pe_min_confidence - confidence, 4),
+        })
+
+    return reasons
+
+
 def classify_alert(
     net_potential: float,
     p_potential: float,

@@ -22,6 +22,7 @@ _JSON_COLUMNS: set[str] = {
     "reasoning",
     "re_eval_triggers",
     "history",
+    "rejection_reasons",
 }
 
 
@@ -442,3 +443,72 @@ class SourceGapRepository:
             "SELECT * FROM source_gaps WHERE ended_at IS NULL"
         )
         return _deserialize_rows(cursor.fetchall())
+
+
+# ---------------------------------------------------------------------------
+# RejectedCandidateRepository
+# ---------------------------------------------------------------------------
+
+
+class RejectedCandidateRepository:
+    """Persistence for scored tokens that were classified as 'ignore'.
+
+    The table uses a compound primary key (token_id, narrative_id) so that
+    only the most recent evaluation per token-narrative pair is kept.
+    INSERT OR REPLACE naturally evicts the stale row on each re-score.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def save(self, candidate: dict) -> None:
+        """Upsert a rejected candidate (INSERT OR REPLACE by token_id+narrative_id)."""
+        cols = [
+            "token_id", "narrative_id", "token_name", "token_symbol",
+            "narrative_name", "score_id", "alert_type",
+            "net_potential", "p_potential", "p_failure", "confidence_score",
+            "watch_gap", "rejection_reasons", "dimension_scores",
+            "risk_flags", "data_gaps", "rejected_at",
+        ]
+        values = []
+        for col in cols:
+            val = candidate.get(col)
+            if col in _JSON_COLUMNS and val is not None and not isinstance(val, str):
+                val = json.dumps(val)
+            values.append(val)
+
+        placeholders = ", ".join("?" for _ in cols)
+        col_names = ", ".join(cols)
+        self.db.connection.execute(
+            f"INSERT OR REPLACE INTO rejected_candidates ({col_names}) VALUES ({placeholders})",
+            values,
+        )
+        self.db.connection.commit()
+
+    def get_top_by_watch_gap(self, limit: int = 100) -> list[dict]:
+        """Return candidates sorted by watch_gap ascending (closest to alert first).
+
+        Only returns candidates where watch_gap >= 0 (i.e., truly below watch
+        threshold).  Candidates above the watch threshold have been promoted to
+        alerts and are excluded.
+        """
+        cursor = self.db.connection.execute(
+            "SELECT * FROM rejected_candidates "
+            "WHERE watch_gap >= 0 "
+            "ORDER BY watch_gap ASC, net_potential DESC "
+            "LIMIT ?",
+            (limit,),
+        )
+        return _deserialize_rows(cursor.fetchall())
+
+    def prune_old(self, older_than: str) -> int:
+        """Delete rejected candidates last evaluated before *older_than* ISO timestamp.
+
+        Returns the number of rows deleted.
+        """
+        cursor = self.db.connection.execute(
+            "DELETE FROM rejected_candidates WHERE rejected_at < ?",
+            (older_than,),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount

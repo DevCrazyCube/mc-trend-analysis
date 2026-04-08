@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from mctrend.api.auth import auth_is_configured
 from mctrend.api.routes import (
     alerts,
+    candidates,
     config,
     events,
     health,
@@ -69,6 +70,7 @@ def create_app() -> FastAPI:
     app.include_router(tokens.router)
     app.include_router(narratives.router)
     app.include_router(alerts.router)
+    app.include_router(candidates.router)
     app.include_router(config.router)
     app.include_router(holdings.router)
     app.include_router(notifications.router)

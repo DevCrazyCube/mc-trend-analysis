@@ -434,4 +434,39 @@ class Database:
             "ON source_health_snapshots (sampled_at)"
         )
 
+        # --- Rejection diagnostics (schema v1-compatible additive) -----------
+        # Compound PK (token_id, narrative_id) keeps only the most recent
+        # evaluation per token-narrative pair.  INSERT OR REPLACE on this pair
+        # naturally evicts the stale row.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rejected_candidates (
+                token_id TEXT NOT NULL,
+                narrative_id TEXT NOT NULL,
+                token_name TEXT,
+                token_symbol TEXT,
+                narrative_name TEXT,
+                score_id TEXT,
+                alert_type TEXT NOT NULL,
+                net_potential REAL,
+                p_potential REAL,
+                p_failure REAL,
+                confidence_score REAL,
+                watch_gap REAL,
+                rejection_reasons TEXT,
+                dimension_scores TEXT,
+                risk_flags TEXT,
+                data_gaps TEXT,
+                rejected_at TEXT NOT NULL,
+                PRIMARY KEY (token_id, narrative_id)
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rejected_candidates_watch_gap "
+            "ON rejected_candidates (watch_gap ASC)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rejected_candidates_rejected_at "
+            "ON rejected_candidates (rejected_at)"
+        )
+
         self.connection.commit()
