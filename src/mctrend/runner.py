@@ -119,6 +119,17 @@ def validate_startup(settings: Settings, demo_mode: bool = False) -> list[str]:
             f"Must be one of: {sorted(_VALID_ENVIRONMENTS)}"
         )
 
+    # Dashboard auth safety in production
+    if settings.environment == "prod":
+        dashboard_api_key = os.environ.get("DASHBOARD_API_KEY", "").strip()
+        if not dashboard_api_key:
+            errors.append(
+                "DASHBOARD_API_KEY is not set, but ENVIRONMENT=prod. "
+                "In production, the dashboard API MUST be protected by a strong API key. "
+                "Set DASHBOARD_API_KEY to a secure random value (e.g., 32+ char, alphanumeric+symbols). "
+                "Without this, the dashboard will be publicly accessible and anyone can read/modify system config."
+            )
+
     # Log level
     if settings.log_level.upper() not in _VALID_LOG_LEVELS:
         errors.append(

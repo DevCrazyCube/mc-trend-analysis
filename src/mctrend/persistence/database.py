@@ -46,6 +46,53 @@ class Database:
         except OSError:
             return 0
 
+    def cleanup_old_data(
+        self,
+        notification_max_age_days: int = 7,
+        snapshot_max_age_days: int = 3,
+    ) -> dict:
+        """Delete old rows from unbounded tables.
+
+        Args:
+            notification_max_age_days: Delete notifications older than N days (default 7)
+            snapshot_max_age_days: Delete snapshots older than N days (default 3)
+
+        Returns:
+            {"notifications_deleted": <int>, "snapshots_deleted": <int>}
+
+        Call this periodically (e.g., once per day) to prevent unbounded growth.
+        """
+        import datetime
+
+        cursor = self.connection.cursor()
+        stats = {"notifications_deleted": 0, "snapshots_deleted": 0}
+
+        # Delete old notifications
+        cutoff_time = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=notification_max_age_days)
+        ).isoformat()
+        cursor.execute(
+            "DELETE FROM operator_notifications WHERE created_at < ?",
+            (cutoff_time,),
+        )
+        stats["notifications_deleted"] = cursor.rowcount
+
+        # Delete old snapshots
+        cutoff_time = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=snapshot_max_age_days)
+        ).isoformat()
+        cursor.execute(
+            "DELETE FROM source_health_snapshots WHERE sampled_at < ?",
+            (cutoff_time,),
+        )
+        stats["snapshots_deleted"] = cursor.rowcount
+
+        self.connection.commit()
+        logger.info("database_cleanup_completed", **stats)
+        return stats
+
     def _check_schema_version(self) -> None:
         """Verify the on-disk schema version matches SCHEMA_VERSION.
 
