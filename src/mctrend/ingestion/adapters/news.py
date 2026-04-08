@@ -18,6 +18,12 @@ class NewsAPIAdapter(SourceAdapter):
     Includes per-source rate-limit cooldown: after ``cooldown_after`` consecutive
     HTTP 429 responses the adapter stops making requests for ``cooldown_seconds``
     (with exponential backoff per episode, capped at ``max_cooldown_seconds``).
+
+    **Cooldown Persistence:** Cooldown state is NOT persisted across process restarts.
+    The cooldown uses process-local ``time.monotonic()`` timestamps, so each process
+    restart resets the cooldown state. This is by design for stateless/cloud-native
+    deployments: if the rate limit is still active, the adapter will quickly re-enter
+    cooldown after the first 429 response.
     """
 
     def __init__(

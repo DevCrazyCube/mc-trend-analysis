@@ -61,6 +61,16 @@ class CorrelationEngine:
         """
         links: list[dict] = []
 
+        # Reject spam/promotional token names upfront
+        token_name = token.get("name", "")
+        if _is_spam_token_name(token_name):
+            logger.info(
+                "token_rejected_spam_name",
+                token_id=token["token_id"],
+                token_name=token_name,
+            )
+            return []
+
         for narrative in active_narratives:
             result = match_token_to_narrative(
                 token_name=token["name"],
@@ -69,8 +79,25 @@ class CorrelationEngine:
                 related_terms=narrative["related_terms"],
             )
 
+            # Check minimum confidence threshold
             if not result["matched"] or result["confidence"] < self.min_confidence:
                 continue
+
+            # Reject weak abbreviation/related-term matches
+            if result["method"] in ("abbreviation", "related_term"):
+                if _is_weak_abbreviation_match(
+                    token["name"], result.get("matched_term", ""), result["confidence"]
+                ):
+                    logger.info(
+                        "token_narrative_link_rejected",
+                        token_id=token["token_id"],
+                        narrative_id=narrative["narrative_id"],
+                        reason="weak_abbreviation_match",
+                        method=result["method"],
+                        confidence=round(result["confidence"], 3),
+                        matched_term=result.get("matched_term", ""),
+                    )
+                    continue
 
             link = _build_link(
                 token_id=token["token_id"],
@@ -80,11 +107,13 @@ class CorrelationEngine:
             links.append(link)
 
             logger.info(
-                "Token %s linked to narrative %s (method=%s, confidence=%.3f)",
-                token["token_id"],
-                narrative["narrative_id"],
-                result["method"],
-                result["confidence"],
+                "token_linked_to_narrative",
+                token_id=token["token_id"],
+                token_name=token_name,
+                narrative_id=narrative["narrative_id"],
+                method=result["method"],
+                confidence=round(result["confidence"], 3),
+                matched_term=result.get("matched_term"),
             )
 
         return links
@@ -113,6 +142,16 @@ class CorrelationEngine:
         links: list[dict] = []
 
         for token in tokens:
+            # Reject spam/promotional token names upfront
+            token_name = token.get("name", "")
+            if _is_spam_token_name(token_name):
+                logger.debug(
+                    "token_rejected_spam_name",
+                    token_id=token["token_id"],
+                    token_name=token_name,
+                )
+                continue
+
             result = match_token_to_narrative(
                 token_name=token["name"],
                 token_symbol=token["symbol"],
@@ -123,6 +162,21 @@ class CorrelationEngine:
             if not result["matched"] or result["confidence"] < self.min_confidence:
                 continue
 
+            # Reject weak abbreviation/related-term matches
+            if result["method"] in ("abbreviation", "related_term"):
+                if _is_weak_abbreviation_match(
+                    token["name"], result.get("matched_term", ""), result["confidence"]
+                ):
+                    logger.debug(
+                        "token_narrative_link_rejected",
+                        token_id=token["token_id"],
+                        narrative_id=narrative["narrative_id"],
+                        reason="weak_abbreviation_match",
+                        method=result["method"],
+                        confidence=round(result["confidence"], 3),
+                    )
+                    continue
+
             link = _build_link(
                 token_id=token["token_id"],
                 narrative_id=narrative["narrative_id"],
@@ -131,11 +185,13 @@ class CorrelationEngine:
             links.append(link)
 
             logger.info(
-                "Narrative %s matched to token %s (method=%s, confidence=%.3f)",
-                narrative["narrative_id"],
-                token["token_id"],
-                result["method"],
-                result["confidence"],
+                "narrative_linked_to_token",
+                narrative_id=narrative["narrative_id"],
+                token_id=token["token_id"],
+                token_name=token_name,
+                method=result["method"],
+                confidence=round(result["confidence"], 3),
+                matched_term=result.get("matched_term"),
             )
 
         return links
@@ -238,6 +294,65 @@ class CorrelationEngine:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_spam_token_name(name: str) -> bool:
+    """Detect spam, promotional, or test token names that should be rejected.
+
+    Returns True if the token name matches known spam patterns.
+    """
+    if not name:
+        return True
+
+    clean = name.strip().upper()
+
+    # Reject names starting with special characters (often paired with $)
+    if clean and clean[0] in "$#@!":
+        return True
+
+    # Reject generic test/demo/fake names
+    spam_keywords = {
+        "TEST", "FAKE", "DEMO", "EXAMPLE", "SCAM", "RUG", "HONEYPOT",
+        "PLACEHOLDER", "DUMMY", "TEMP", "XXX", "ZZZ",
+    }
+    if clean in spam_keywords:
+        return True
+
+    # Reject generic single letters or short repeated chars
+    if len(clean) <= 2 and (all(c == clean[0] for c in clean) or clean == "OK" or clean == "NO"):
+        return True
+
+    return False
+
+
+def _is_weak_abbreviation_match(token_name: str, anchor_term: str, confidence: float) -> bool:
+    """Determine if this abbreviation match is too weak and should be rejected.
+
+    Rejects:
+    - Very short token names matching longer anchors (e.g., "A" matching "ADOPTION")
+    - Single-letter matches
+    - Matches where the token is just the first 2 chars of a much longer anchor
+
+    Returns True if the match should be rejected (is too weak).
+    """
+    tn = token_name.strip().upper().replace(" ", "").replace("-", "").replace("_", "")
+    at = anchor_term.strip().upper().replace(" ", "").replace("-", "").replace("_", "")
+
+    # Reject single-letter matches entirely
+    if len(tn) <= 1:
+        return True
+
+    # Reject 2-char matches against much longer anchors (e.g., "AI" vs "ARTIFICIAL_INTELLIGENCE")
+    # Only allow if confidence is high (> 0.70) or the prefix is at least 1/3 of anchor length
+    if len(tn) == 2 and len(at) > 8 and confidence < 0.70:
+        return True
+
+    # Reject very weak related-term matches (confidence < 0.40)
+    # These are often false positives (e.g., "T" matching "TOKEN")
+    if confidence < 0.40 and len(tn) < 3:
+        return True
+
+    return False
 
 
 def _build_link(token_id: str, narrative_id: str, match_result: dict) -> dict:

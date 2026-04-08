@@ -7,7 +7,7 @@ logger = structlog.get_logger(__name__)
 
 # Increment this whenever the schema changes. Startup validation checks this
 # against the value stored in the schema_version table.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaVersionError(RuntimeError):
@@ -97,8 +97,7 @@ class Database:
         """Verify the on-disk schema version matches SCHEMA_VERSION.
 
         On a fresh database, writes SCHEMA_VERSION. On an existing database,
-        raises SchemaVersionError if the version does not match — the operator
-        must run a migration or wipe the database manually.
+        applies any pending migrations or raises SchemaVersionError.
         """
         cursor = self.connection.cursor()
         row = cursor.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
@@ -109,14 +108,45 @@ class Database:
             )
             self.connection.commit()
             logger.info("schema_version_initialized", version=SCHEMA_VERSION)
-        elif row["version"] != SCHEMA_VERSION:
+        elif row["version"] < SCHEMA_VERSION:
+            self._migrate_schema(row["version"], SCHEMA_VERSION)
+        elif row["version"] > SCHEMA_VERSION:
             raise SchemaVersionError(
-                f"Database schema version {row['version']} does not match "
+                f"Database schema version {row['version']} is newer than "
                 f"expected version {SCHEMA_VERSION}. "
-                "Run a migration or remove the database file to reinitialize."
+                "The codebase is out of date."
             )
         else:
             logger.debug("schema_version_ok", version=SCHEMA_VERSION)
+
+    def _migrate_schema(self, from_version: int, to_version: int) -> None:
+        """Apply schema migrations from from_version to to_version."""
+        cursor = self.connection.cursor()
+        logger.info("schema_migration_starting", from_version=from_version, to_version=to_version)
+
+        # Migration from version 2 to 3: add relevance_blocked and relevance_score columns
+        if from_version <= 2 and to_version >= 3:
+            try:
+                cursor.execute(
+                    "ALTER TABLE narratives ADD COLUMN relevance_blocked INTEGER CHECK(relevance_blocked IS NULL OR relevance_blocked IN (0, 1)) DEFAULT 0"
+                )
+                cursor.execute(
+                    "ALTER TABLE narratives ADD COLUMN relevance_score REAL CHECK(relevance_score IS NULL OR (relevance_score >= 0 AND relevance_score <= 1))"
+                )
+                logger.info("schema_migration_v2_to_v3_columns_added")
+            except sqlite3.OperationalError as e:
+                if "already exists" in str(e):
+                    logger.info("schema_migration_v2_to_v3_columns_already_exist")
+                else:
+                    raise
+
+        # Update schema_version
+        cursor.execute(
+            "UPDATE schema_version SET version = ?, applied_at = datetime('now') WHERE 1=1",
+            (to_version,),
+        )
+        self.connection.commit()
+        logger.info("schema_migration_completed", new_version=to_version)
 
     def _create_tables(self) -> None:
         """Create all tables and indices required by the system."""
@@ -203,7 +233,9 @@ class Database:
                 merged_into TEXT,
                 competition_status TEXT,
                 competition_rank INTEGER,
-                data_gaps TEXT
+                data_gaps TEXT,
+                relevance_blocked INTEGER CHECK(relevance_blocked IS NULL OR relevance_blocked IN (0, 1)) DEFAULT 0,
+                relevance_score REAL CHECK(relevance_score IS NULL OR (relevance_score >= 0 AND relevance_score <= 1))
             )
         """)
 

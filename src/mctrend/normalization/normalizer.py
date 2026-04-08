@@ -307,3 +307,49 @@ def _safe_int(value) -> int | None:
         return int(value)
     except (ValueError, TypeError):
         return None
+
+
+def normalize_token_name(name: str) -> str:
+    """Normalize a token name to canonical form for deduplication.
+
+    Converts to lowercase, strips common special characters and punctuation,
+    and removes common suffixes. This allows variants like "$MOON", "moon",
+    "MOON Token" to collapse into the same normalized form.
+
+    Example:
+        "$MOON Token" -> "moon"
+        "MOON" -> "moon"
+        "moon-finance" -> "moon"
+    """
+    if not name:
+        return ""
+
+    # Lowercase
+    normalized = name.lower().strip()
+
+    # Remove leading special characters ($, #, etc.)
+    while normalized and normalized[0] in "$#@!":
+        normalized = normalized[1:].lstrip()
+
+    # Remove trailing special characters
+    while normalized and normalized[-1] in "$#@!":
+        normalized = normalized[:-1].rstrip()
+
+    # Remove common suffixes and words
+    suffixes = [
+        " token", " coin", " finance", " pro", " protocol",
+        "-token", "-coin", "-finance", "-pro", "-protocol",
+        " v2", " v3", "-v2", "-v3",
+    ]
+    for suffix in suffixes:
+        if normalized.endswith(suffix):
+            normalized = normalized[:-len(suffix)].rstrip()
+            break
+
+    # Replace hyphens and underscores with empty string
+    normalized = normalized.replace("-", "").replace("_", "").replace(".", "")
+
+    # Remove any remaining punctuation and spaces
+    normalized = "".join(c for c in normalized if c.isalnum())
+
+    return normalized

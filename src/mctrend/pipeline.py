@@ -35,6 +35,7 @@ from mctrend.normalization.normalizer import (
     merge_narratives,
     normalize_event,
     normalize_token,
+    normalize_token_name,
 )
 from mctrend.persistence.database import Database
 from mctrend.persistence.repositories import (
@@ -260,11 +261,74 @@ class Pipeline:
 
         summary["events_ingested"] = len(new_events)
 
-        # Step 3.5: Evaluate all non-terminal narratives through intelligence engine
+        # Step 3.4: Apply relevance gate to ALL narratives before evaluation/clustering/competition.
+        # This is the authoritative relevance gate — blocked narratives are excluded from the
+        # entire downstream pipeline, not just correlation.
+        narratives_blocked_early = 0
+        try:
+            all_narratives_for_relevance = self.narrative_repo.get_active()
+            for narrative in all_narratives_for_relevance:
+                anchor_terms = narrative.get("anchor_terms") or []
+                if isinstance(anchor_terms, str):
+                    import json as _json
+                    try:
+                        anchor_terms = _json.loads(anchor_terms)
+                    except Exception:
+                        anchor_terms = []
+                sources = narrative.get("sources") or []
+                if isinstance(sources, str):
+                    import json as _json
+                    try:
+                        sources = _json.loads(sources)
+                    except Exception:
+                        sources = []
+                source_names = [s.get("source_name", "") for s in sources if isinstance(s, dict)]
+                rel = score_narrative_relevance(
+                    anchor_terms=anchor_terms,
+                    description=narrative.get("description", ""),
+                    source_names=source_names,
+                    positive_saturation=self._relevance_positive_saturation,
+                    veto_override_threshold=self._relevance_veto_override_threshold,
+                )
+                is_blocked = rel < self._narratives_min_relevance
+                if is_blocked:
+                    narratives_blocked_early += 1
+                    logger.info(
+                        "narrative_relevance_gate_blocks",
+                        narrative_id=narrative.get("narrative_id"),
+                        description=str(narrative.get("description", ""))[:60],
+                        relevance=round(rel, 3),
+                        threshold=self._narratives_min_relevance,
+                    )
+                # Mark narrative with relevance status for use downstream
+                # Store as 1 for blocked, 0 for not blocked (integer for SQLite)
+                self.narrative_repo.update_fields(
+                    narrative.get("narrative_id"),
+                    {
+                        "relevance_blocked": 1 if is_blocked else 0,
+                        "relevance_score": round(rel, 3)
+                    }
+                )
+        except Exception as e:
+            logger.error("pipeline_relevance_gate_error", error=str(e))
+            summary["errors"].append(f"relevance_gate: {e}")
+
+        if narratives_blocked_early:
+            logger.info(
+                "narrative_relevance_gate_summary",
+                blocked=narratives_blocked_early,
+                total=len(all_narratives_for_relevance),
+            )
+
+        # Step 3.5: Evaluate non-terminal narratives through intelligence engine.
+        # Filters out relevance-blocked narratives.
         # Computes velocity, strength, and lifecycle state for each narrative.
         narratives_evaluated = 0
         try:
             all_narratives = self.narrative_repo.get_active()
+            # Filter out relevance-blocked narratives before evaluation
+            # relevance_blocked is stored as 0/1 in the database
+            all_narratives = [n for n in all_narratives if not n.get("relevance_blocked")]
             now = datetime.now(timezone.utc)
             for narrative in all_narratives:
                 try:
@@ -287,9 +351,12 @@ class Pipeline:
 
         summary["narratives_evaluated"] = narratives_evaluated
 
-        # Step 3.6: Cluster narratives for valid competition grouping
+        # Step 3.6: Cluster narratives for valid competition grouping.
+        # Filters out relevance-blocked narratives.
         try:
             scoring_narratives = self.narrative_repo.get_for_scoring()
+            # Filter out relevance-blocked narratives
+            scoring_narratives = [n for n in scoring_narratives if not n.get("relevance_blocked")]
             if scoring_narratives:
                 # Build token_links map for token-overlap clustering
                 narr_token_links: dict[str, list[str]] = {}
@@ -313,9 +380,12 @@ class Pipeline:
         # Step 3.7: Narrative competition — select winners per cluster group.
         # Persist competition_status and competition_rank on narratives.
         # Store full outcomes for dashboard visibility.
+        # Filters out relevance-blocked narratives.
         competition_outcomes: list[dict] = []
         try:
             fresh_scoring = self.narrative_repo.get_for_scoring()
+            # Filter out relevance-blocked narratives
+            fresh_scoring = [n for n in fresh_scoring if not n.get("relevance_blocked")]
             if fresh_scoring:
                 ranked = self.narrative_intel.select_narrative_winners(fresh_scoring)
                 for n in ranked:
@@ -355,50 +425,14 @@ class Pipeline:
         try:
             candidate_narratives = self.narrative_repo.get_for_scoring()
 
-            # Step 4a: Narrative relevance gate — block low-relevance narratives from
-            # token linking.  Computed from stored anchor_terms + description.
-            # This is separate from lifecycle state: a narrative can be TRENDING but
-            # semantically irrelevant (e.g., a sports event that accumulated sources).
-            narratives_blocked = 0
-            active_narratives = []
-            for narr in candidate_narratives:
-                anchor_terms = narr.get("anchor_terms") or []
-                if isinstance(anchor_terms, str):
-                    import json as _json
-                    try:
-                        anchor_terms = _json.loads(anchor_terms)
-                    except Exception:
-                        anchor_terms = []
-                sources = narr.get("sources") or []
-                if isinstance(sources, str):
-                    import json as _json
-                    try:
-                        sources = _json.loads(sources)
-                    except Exception:
-                        sources = []
-                source_names = [s.get("source_name", "") for s in sources if isinstance(s, dict)]
-                rel = score_narrative_relevance(
-                    anchor_terms=anchor_terms,
-                    description=narr.get("description", ""),
-                    source_names=source_names,
-                    positive_saturation=self._relevance_positive_saturation,
-                    veto_override_threshold=self._relevance_veto_override_threshold,
-                )
-                if rel >= self._narratives_min_relevance:
-                    active_narratives.append(narr)
-                else:
-                    narratives_blocked += 1
-                    logger.info(
-                        "narrative_blocked_low_relevance",
-                        narrative_id=narr.get("narrative_id"),
-                        description=str(narr.get("description", ""))[:60],
-                        relevance=round(rel, 3),
-                        threshold=self._narratives_min_relevance,
-                    )
+            # Step 4a: Filter narratives by relevance gate (already applied in Step 3.4).
+            # Here we use the cached relevance_blocked flag for efficiency.
+            active_narratives = [n for n in candidate_narratives if not n.get("relevance_blocked")]
+            narratives_blocked = len(candidate_narratives) - len(active_narratives)
             summary["narratives_blocked_low_relevance"] = narratives_blocked
             if narratives_blocked:
                 logger.info(
-                    "narrative_gate_summary",
+                    "narrative_relevance_gate_blocks_correlation",
                     candidates=len(candidate_narratives),
                     blocked=narratives_blocked,
                     passed=len(active_narratives),
@@ -556,14 +590,37 @@ class Pipeline:
 
         for nid, items in narrative_scored_tokens.items():
             # Token competition: rank tokens within this narrative
-            tokens_for_competition = [
-                {
+            # Normalize token names to collapse variants (e.g., "$MOON" and "MOON" -> "moon")
+            tokens_for_competition = []
+            normalized_names: dict[str, list[dict]] = {}  # normalized_name -> list of candidates
+
+            for item in items:
+                token_name = item["token"].get("name", "")
+                normalized = normalize_token_name(token_name)
+
+                candidate = {
                     "token_id": item["token"]["token_id"],
                     "net_potential": item["scored"].get("net_potential", 0.0) or 0.0,
                     "_item": item,
+                    "_original_name": token_name,
+                    "_normalized_name": normalized,
                 }
-                for item in items
-            ]
+                tokens_for_competition.append(candidate)
+                normalized_names.setdefault(normalized, []).append(candidate)
+
+            # Log normalization collapses (multiple tokens with same normalized name)
+            collapse_count = 0
+            for normalized, candidates in normalized_names.items():
+                if len(candidates) > 1:
+                    collapse_count += 1
+                    original_names = [c["_original_name"] for c in candidates]
+                    logger.info(
+                        "token_name_normalization_collapse",
+                        narrative_id=nid,
+                        normalized_name=normalized,
+                        original_names=original_names,
+                        count=len(candidates),
+                    )
 
             ranked = self.narrative_intel.select_token_winners(tokens_for_competition)
 
