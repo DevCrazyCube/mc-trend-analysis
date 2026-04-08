@@ -35,14 +35,14 @@ def settings(temp_db):
 class TestPipelineIntegration:
     def test_build_system(self, settings):
         """System builds without errors."""
-        pipeline, db = build_system(settings)
+        pipeline, db, _ws = build_system(settings)
         assert pipeline is not None
         assert db is not None
         db.close()
 
     def test_demo_data_injection(self, settings):
         """Demo data is injected correctly."""
-        pipeline, db = build_system(settings)
+        pipeline, db, _ws = build_system(settings)
         inject_demo_data(pipeline)
 
         tokens = pipeline.token_repo.list_by_status("new")
@@ -56,7 +56,7 @@ class TestPipelineIntegration:
     @pytest.mark.asyncio
     async def test_full_cycle(self, settings):
         """Full pipeline cycle processes demo data end-to-end."""
-        pipeline, db = build_system(settings)
+        pipeline, db, _ws = build_system(settings)
         inject_demo_data(pipeline)
 
         summary = await pipeline.run_cycle()
@@ -92,7 +92,7 @@ class TestPipelineIntegration:
     @pytest.mark.asyncio
     async def test_idempotent_cycle(self, settings):
         """Running a second cycle doesn't duplicate data."""
-        pipeline, db = build_system(settings)
+        pipeline, db, _ws = build_system(settings)
         inject_demo_data(pipeline)
 
         summary1 = await pipeline.run_cycle()
@@ -109,7 +109,7 @@ class TestPipelineIntegration:
     @pytest.mark.asyncio
     async def test_stats_after_cycle(self, settings):
         """Pipeline stats reflect completed work."""
-        pipeline, db = build_system(settings)
+        pipeline, db, _ws = build_system(settings)
         inject_demo_data(pipeline)
 
         await pipeline.run_cycle()

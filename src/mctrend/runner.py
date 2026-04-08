@@ -13,6 +13,7 @@ import asyncio
 import os
 import signal
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from mctrend.correlation.linker import CorrelationEngine
 from mctrend.delivery.channels import ConsoleChannel, DeliveryRouter, TelegramChannel
 from mctrend.ingestion.adapters.news import NewsAPIAdapter
 from mctrend.ingestion.adapters.pumpfun import PumpFunAdapter
+from mctrend.ingestion.adapters.pumpportal_ws import PumpPortalWebSocketAdapter
 from mctrend.ingestion.adapters.solana_rpc import SolanaRPCAdapter
 from mctrend.ingestion.adapters.trends import SerpAPITrendsAdapter
 from mctrend.ingestion.manager import IngestionManager
@@ -63,11 +65,19 @@ def _source_status_map(settings: Settings, demo_mode: bool) -> dict[str, str]:
 
     if demo_mode:
         status["pump.fun"] = "demo-disabled"
+        status["pumpportal_ws"] = "demo-disabled"
         status["solana_rpc"] = "demo-disabled"
         status["newsapi"] = "demo-disabled"
         status["serpapi_trends"] = "demo-disabled"
     else:
-        # pump.fun — only registered when PUMPFUN_API_URL is explicitly set
+        # pumpportal_ws — primary discovery path
+        if settings.pumpportal_ws_enabled:
+            status["pumpportal_ws"] = "enabled (WebSocket real-time discovery)"
+        else:
+            status["pumpportal_ws"] = (
+                "disabled (set PUMPPORTAL_WS_ENABLED=true to enable real-time discovery)"
+            )
+        # pump.fun REST — only registered when PUMPFUN_API_URL is explicitly set
         if settings.pumpfun_api_url:
             status["pump.fun"] = "enabled-unreliable"
         else:
@@ -165,6 +175,8 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
     # Ingestion
     ingestion = IngestionManager()
 
+    ws_adapter: PumpPortalWebSocketAdapter | None = None
+
     if demo_mode:
         # Demo mode: no live adapters registered → zero external HTTP calls.
         # All data comes from inject_demo_data() called before run_cycle().
@@ -172,7 +184,24 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
     else:
         # Live adapters — register in order of reliability.
 
-        # Pump.fun: only register when an explicit URL is configured.
+        # PumpPortal WebSocket: primary real-time discovery path.
+        if settings.pumpportal_ws_enabled:
+            ws_adapter = PumpPortalWebSocketAdapter(
+                ws_url=settings.pumpportal_ws_url,
+                stale_timeout_seconds=settings.pumpportal_ws_stale_timeout_seconds,
+            )
+            ingestion.register_token_adapter(ws_adapter)
+            logger.info(
+                "pumpportal_ws_adapter_registered",
+                url=settings.pumpportal_ws_url,
+            )
+        else:
+            logger.info(
+                "pumpportal_ws_disabled",
+                hint="Set PUMPPORTAL_WS_ENABLED=true to enable real-time token discovery",
+            )
+
+        # Pump.fun REST: only register when an explicit URL is configured.
         # The default public endpoint is non-functional (persistent 503).
         if settings.pumpfun_api_url:
             ingestion.register_token_adapter(
@@ -182,13 +211,14 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
                     fetch_limit=settings.pumpfun_fetch_limit,
                 )
             )
-        else:
+        elif not settings.pumpportal_ws_enabled:
+            # Neither WS nor REST discovery is configured
             logger.warning(
                 "live_token_discovery_unavailable",
                 reason=(
-                    "PUMPFUN_API_URL is not set and the default public endpoint is "
-                    "non-functional. Set PUMPFUN_API_URL to a working token listing "
-                    "REST API to enable token ingestion."
+                    "No token discovery source configured. "
+                    "Set PUMPPORTAL_WS_ENABLED=true for real-time WebSocket discovery, "
+                    "or PUMPFUN_API_URL to a working token listing REST API."
                 ),
             )
 
@@ -258,7 +288,7 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
         settings=settings,
     )
 
-    return pipeline, db
+    return pipeline, db, ws_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +469,13 @@ async def run_once(settings: Settings, demo: bool = False):
     When *demo* is True, no live adapters are registered and only synthetic
     data (injected by ``inject_demo_data``) is processed.
     """
-    pipeline, db = build_system(settings, demo_mode=demo)
+    pipeline, db, ws_adapter = build_system(settings, demo_mode=demo)
+
+    # Start WS adapter if registered
+    if ws_adapter is not None:
+        ws_adapter.start_background_task()
+        # Brief settle time so first cycle has some events
+        await asyncio.sleep(2)
 
     if demo:
         inject_demo_data(pipeline)
@@ -456,18 +492,32 @@ async def run_once(settings: Settings, demo: bool = False):
     for key, value in stats.items():
         print(f"  {key}: {value}")
 
+    if ws_adapter is not None:
+        await ws_adapter.stop()
     await pipeline.ingestion.close_all()
     await pipeline.delivery.close_all()
     db.close()
 
 
-async def run_continuous(settings: Settings):
+async def run_continuous(settings: Settings, dashboard: bool = False):
     """Run continuous polling loop with graceful shutdown on SIGINT/SIGTERM."""
-    pipeline, db = build_system(settings)
+    from mctrend.api import deps as api_deps
+
+    pipeline, db, ws_adapter = build_system(settings)
+
+    # Register DB and WS adapter with the API layer
+    api_deps.set_db(db)
+    api_deps.set_pipeline_start_time(time.time())
+    if ws_adapter is not None:
+        api_deps.set_ws_adapter(ws_adapter)
+
+    # Start WebSocket adapter background task
+    if ws_adapter is not None:
+        ws_adapter.start_background_task()
+        logger.info("pumpportal_ws_started")
 
     # Shutdown flag — set by signal handlers; cycle completes before exit
     shutdown = asyncio.Event()
-    _current_cycle: list[asyncio.Task] = []
 
     def handle_signal(sig, frame):
         logger.info("shutdown_signal_received", signal=sig)
@@ -481,11 +531,46 @@ async def run_continuous(settings: Settings):
         environment=settings.environment,
         token_interval=settings.polling_interval_tokens,
         event_interval=settings.polling_interval_events,
+        dashboard=dashboard,
     )
+
+    tasks = []
+
+    # Start dashboard server if requested
+    if dashboard:
+        import uvicorn
+        from mctrend.api.app import create_app
+
+        app = create_app()
+
+        config = uvicorn.Config(
+            app,
+            host=settings.dashboard_host,
+            port=settings.dashboard_port,
+            log_level="warning",  # suppress uvicorn noise; use structlog
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        tasks.append(asyncio.create_task(server.serve(), name="dashboard_server"))
+        logger.info(
+            "dashboard_starting",
+            host=settings.dashboard_host,
+            port=settings.dashboard_port,
+            url=f"http://{settings.dashboard_host}:{settings.dashboard_port}",
+        )
+        print(
+            f"\n  Dashboard: http://{settings.dashboard_host}:{settings.dashboard_port}\n"
+        )
+
+    from mctrend.api.routes.events import broadcast
 
     try:
         while not shutdown.is_set():
             summary = await pipeline.run_cycle()
+
+            # Update dashboard cycle stats and broadcast
+            api_deps.update_cycle_stats(summary)
+            broadcast("cycle_complete", summary)
 
             if summary.get("errors"):
                 logger.warning("cycle_had_errors", errors=summary["errors"])
@@ -500,6 +585,14 @@ async def run_continuous(settings: Settings):
                 pass  # Normal: timeout means we loop again
     finally:
         logger.info("pipeline_shutting_down", reason="signal_received")
+        for task in tasks:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if ws_adapter is not None:
+            await ws_adapter.stop()
         await pipeline.ingestion.close_all()
         await pipeline.delivery.close_all()
         db.close()
@@ -570,6 +663,11 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run single cycle and exit")
     parser.add_argument("--demo", action="store_true", help="Inject demo data for testing")
     parser.add_argument("--status", action="store_true", help="Show system status")
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Start operator dashboard API server alongside the pipeline",
+    )
     parser.add_argument("--env", default=".env", help="Path to .env file")
     args = parser.parse_args()
 
@@ -593,7 +691,7 @@ def main():
         elif args.once or args.demo:
             asyncio.run(run_once(settings, demo=args.demo))
         else:
-            asyncio.run(run_continuous(settings))
+            asyncio.run(run_continuous(settings, dashboard=args.dashboard))
     except SchemaVersionError as e:
         print(f"\n[SCHEMA VERSION ERROR] {e}", file=sys.stderr)
         print(

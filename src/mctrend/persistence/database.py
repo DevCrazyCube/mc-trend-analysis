@@ -302,4 +302,89 @@ class Database:
             "ON source_gaps (source_name)"
         )
 
+        # --- Dashboard extension tables (schema v1-compatible additive) ----
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS holdings (
+                holding_id TEXT PRIMARY KEY,
+                token_address TEXT NOT NULL,
+                token_name TEXT,
+                token_symbol TEXT,
+                status TEXT NOT NULL DEFAULT 'watching',
+                size_sol REAL,
+                avg_entry_price_sol REAL,
+                current_price_sol REAL,
+                realized_pnl_sol REAL,
+                unrealized_pnl_sol REAL,
+                conviction TEXT,
+                exit_plan TEXT,
+                notes TEXT,
+                alert_id TEXT,
+                linked_narrative TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tracked_wallets (
+                wallet_id TEXT PRIMARY KEY,
+                address TEXT UNIQUE NOT NULL,
+                label TEXT,
+                notes TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS operator_notifications (
+                notification_id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT,
+                severity TEXT NOT NULL DEFAULT 'info',
+                source_name TEXT,
+                reference_id TEXT,
+                reference_type TEXT,
+                read INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS source_health_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                source_name TEXT NOT NULL,
+                healthy INTEGER NOT NULL,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                extra_meta TEXT,
+                sampled_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_holdings_token_address "
+            "ON holdings (token_address)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_holdings_status ON holdings (status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_notifications_read "
+            "ON operator_notifications (read)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operator_notifications_created "
+            "ON operator_notifications (created_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_health_snapshots_source "
+            "ON source_health_snapshots (source_name)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_health_snapshots_sampled "
+            "ON source_health_snapshots (sampled_at)"
+        )
+
         self.connection.commit()

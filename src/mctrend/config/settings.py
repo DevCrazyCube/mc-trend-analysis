@@ -355,6 +355,33 @@ class Settings(BaseModel):
         description="Minimum confidence_score to emit any alert",
     )
 
+    # -- Dashboard / API server -----------------------------------------------
+    dashboard_host: str = Field(
+        "127.0.0.1",
+        description="Host/IP for the operator dashboard API server",
+    )
+    dashboard_port: int = Field(
+        8765,
+        gt=0,
+        lt=65536,
+        description="Port for the operator dashboard API server",
+    )
+
+    # -- PumpPortal WebSocket -------------------------------------------------
+    pumpportal_ws_enabled: bool = Field(
+        False,
+        description="Enable real-time token discovery via PumpPortal WebSocket",
+    )
+    pumpportal_ws_url: str = Field(
+        "wss://pumpportal.fun/api/data",
+        description="PumpPortal WebSocket URL",
+    )
+    pumpportal_ws_stale_timeout_seconds: float = Field(
+        120.0,
+        gt=0,
+        description="Seconds without a message before reconnecting the WebSocket",
+    )
+
     # -- Ingestion adapter parameters -----------------------------------------
     news_query_terms: list[str] = Field(
         default_factory=lambda: ["crypto", "meme", "viral", "trending"],
@@ -449,6 +476,23 @@ class Settings(BaseModel):
             ),
             pumpfun_api_url=env.get(
                 "PUMPFUN_API_URL", cls.model_fields["pumpfun_api_url"].default
+            ),
+            dashboard_host=env.get(
+                "DASHBOARD_HOST", cls.model_fields["dashboard_host"].default
+            ),
+            dashboard_port=int(
+                env.get("DASHBOARD_PORT", cls.model_fields["dashboard_port"].default)
+            ),
+            pumpportal_ws_enabled=env.get("PUMPPORTAL_WS_ENABLED", "false").lower()
+                in ("1", "true", "yes"),
+            pumpportal_ws_url=env.get(
+                "PUMPPORTAL_WS_URL", cls.model_fields["pumpportal_ws_url"].default
+            ),
+            pumpportal_ws_stale_timeout_seconds=float(
+                env.get(
+                    "PUMPPORTAL_WS_STALE_TIMEOUT_SECONDS",
+                    cls.model_fields["pumpportal_ws_stale_timeout_seconds"].default,
+                )
             ),
             newsapi_key=env.get("NEWSAPI_KEY", cls.model_fields["newsapi_key"].default),
             serpapi_key=env.get("SERPAPI_KEY", cls.model_fields["serpapi_key"].default),
