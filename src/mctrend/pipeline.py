@@ -161,6 +161,7 @@ class Pipeline:
             "errors": [],
             # Degraded-mode indicators: populated during ingest step
             "news_source_available": True,
+            "x_source_available": True,
             "narrative_path_offline": False,
             "scoring_limited_reason": None,
         }
@@ -223,6 +224,28 @@ class Pipeline:
                     reason=reason,
                     tokens_available=len(raw_tokens) > 0,
                     hint="Tokens will be ingested but narrative-driven scoring will be zero until news source recovers.",
+                )
+
+            # X (Twitter) degraded-mode detection
+            x_meta = source_health.get("x", {})
+            x_healthy = x_meta.get("healthy", True)
+            x_in_cooldown = x_meta.get("in_rate_limit_cooldown", False)
+            x_available = bool(x_meta) and x_healthy and not x_in_cooldown
+            if x_meta and not x_available:
+                summary["x_source_available"] = False
+                if x_in_cooldown:
+                    x_remaining = x_meta.get("cooldown_remaining_seconds", 0)
+                    x_reason = (
+                        f"x rate-limited (cooldown {x_remaining:.0f}s remaining, "
+                        f"episode {x_meta.get('cooldown_episodes', '?')})"
+                    )
+                else:
+                    x_reason = "x unhealthy"
+                logger.warning(
+                    "pipeline_degraded_mode",
+                    source="x",
+                    reason=x_reason,
+                    hint="X narrative detection unavailable; pipeline continues with other sources.",
                 )
 
         except Exception as e:

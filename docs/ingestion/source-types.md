@@ -184,6 +184,18 @@ This document defines the taxonomy of data source categories, their trust profil
 
 **Special handling:** Social data is never used as the sole basis for any score above `watch` tier. It must be corroborated by at least one other source category.
 
+### X (Twitter) — Implemented
+
+X is a first-class, real-time narrative signal layer. See `docs/ingestion/x-twitter-integration.md` for full design.
+
+- **Adapter:** `XAPIAdapter` in `src/mctrend/ingestion/adapters/x_api.py`
+- **Mode:** Polling via X API v2 Recent Search (`/tweets/search/recent`)
+- **Source type:** `social_media`
+- **Source name:** `@<author_handle>` (per-tweet attribution)
+- **Signal extraction:** Deterministic (no LLM) — cashtag extraction, hashtag extraction, engagement scoring, bot/spam filtering
+- **Rate limiting:** Credit-based budget with exponential-backoff cooldown, state persisted across restarts
+- **Degraded mode:** Pipeline continues without X; `x_source_available: false` in cycle summary
+
 ---
 
 ## Source Category: Community Channels

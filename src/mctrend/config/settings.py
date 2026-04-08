@@ -516,6 +516,49 @@ class Settings(BaseModel):
         50, gt=0, description="Number of tokens to fetch per Pump.fun API call"
     )
 
+    # -- X (Twitter) adapter --------------------------------------------------
+    x_api_bearer_token: str = Field(
+        "",
+        description="X API v2 bearer token for tweet search",
+    )
+    x_enabled: bool = Field(
+        False,
+        description="Enable X (Twitter) as a narrative source adapter",
+    )
+    x_query_terms: list[str] = Field(
+        default_factory=lambda: [
+            "solana memecoin launch",
+            "pump.fun token",
+            "$SOL token launch",
+            "solana token CA",
+        ],
+        description="Search query terms for X API — narrow crypto-specific queries preferred",
+    )
+    x_max_requests_per_cycle: int = Field(
+        5, gt=0, le=50,
+        description="Maximum X API search calls per pipeline cycle (credit budget control)",
+    )
+    x_signal_strength: float = Field(
+        0.5, ge=0.0, le=1.0,
+        description="Base signal strength for X events (before engagement weighting)",
+    )
+    x_cooldown_after: int = Field(
+        2, ge=1,
+        description="Consecutive 429 responses before entering X rate-limit cooldown",
+    )
+    x_cooldown_seconds: float = Field(
+        60.0, gt=0,
+        description="Base cooldown duration in seconds for X rate-limit",
+    )
+    x_max_cooldown_seconds: float = Field(
+        900.0, gt=0,
+        description="Maximum X cooldown duration in seconds (caps exponential growth)",
+    )
+    x_rate_limit_state_path: str = Field(
+        "data/x_ratelimit_state.json",
+        description="Path to the JSON file that persists X rate-limit state across restarts",
+    )
+
     # -- External call defaults -----------------------------------------------
     external_api_timeout_seconds: float = Field(
         10.0, gt=0, description="Default timeout for external API calls"
@@ -714,4 +757,48 @@ class Settings(BaseModel):
                 "NEWSAPI_RATE_LIMIT_STATE_PATH",
                 cls.model_fields["newsapi_rate_limit_state_path"].default,
             ),
+            x_api_bearer_token=env.get(
+                "X_API_BEARER_TOKEN",
+                cls.model_fields["x_api_bearer_token"].default,
+            ),
+            x_enabled=env.get("X_ENABLED", "false").lower() in ("1", "true", "yes"),
+            x_max_requests_per_cycle=int(
+                env.get(
+                    "X_MAX_REQUESTS_PER_CYCLE",
+                    cls.model_fields["x_max_requests_per_cycle"].default,
+                )
+            ),
+            x_signal_strength=float(
+                env.get(
+                    "X_SIGNAL_STRENGTH",
+                    cls.model_fields["x_signal_strength"].default,
+                )
+            ),
+            x_rate_limit_state_path=env.get(
+                "X_RATE_LIMIT_STATE_PATH",
+                cls.model_fields["x_rate_limit_state_path"].default,
+            ),
+            x_cooldown_after=int(
+                env.get(
+                    "X_COOLDOWN_AFTER",
+                    cls.model_fields["x_cooldown_after"].default,
+                )
+            ),
+            x_cooldown_seconds=float(
+                env.get(
+                    "X_COOLDOWN_SECONDS",
+                    cls.model_fields["x_cooldown_seconds"].default,
+                )
+            ),
+            x_max_cooldown_seconds=float(
+                env.get(
+                    "X_MAX_COOLDOWN_SECONDS",
+                    cls.model_fields["x_max_cooldown_seconds"].default,
+                )
+            ),
+            x_query_terms=[
+                t.strip()
+                for t in env.get("X_QUERY_TERMS", "").split(",")
+                if t.strip()
+            ] or cls.model_fields["x_query_terms"].default_factory(),
         )

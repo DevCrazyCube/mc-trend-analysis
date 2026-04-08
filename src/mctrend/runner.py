@@ -28,6 +28,7 @@ from mctrend.ingestion.adapters.pumpfun import PumpFunAdapter
 from mctrend.ingestion.adapters.pumpportal_ws import PumpPortalWebSocketAdapter
 from mctrend.ingestion.adapters.solana_rpc import SolanaRPCAdapter
 from mctrend.ingestion.adapters.trends import SerpAPITrendsAdapter
+from mctrend.ingestion.adapters.x_api import XAPIAdapter
 from mctrend.ingestion.manager import IngestionManager
 from mctrend.normalization.normalizer import merge_narratives, normalize_event, normalize_token
 from mctrend.persistence.database import Database, SchemaVersionError
@@ -69,6 +70,7 @@ def _source_status_map(settings: Settings, demo_mode: bool) -> dict[str, str]:
         status["solana_rpc"] = "demo-disabled"
         status["newsapi"] = "demo-disabled"
         status["serpapi_trends"] = "demo-disabled"
+        status["x"] = "demo-disabled"
     else:
         # pumpportal_ws — primary discovery path
         if settings.pumpportal_ws_enabled:
@@ -95,6 +97,13 @@ def _source_status_map(settings: Settings, demo_mode: bool) -> dict[str, str]:
         status["newsapi"] = "enabled" if settings.newsapi_key else "disabled (NEWSAPI_KEY not set)"
         # serpapi_trends — API discontinued regardless of key
         status["serpapi_trends"] = "unsupported (SerpAPI endpoint discontinued)"
+        # X (Twitter)
+        if settings.x_enabled and settings.x_api_bearer_token:
+            status["x"] = "enabled"
+        elif settings.x_enabled:
+            status["x"] = "disabled (X_ENABLED=true but X_API_BEARER_TOKEN not set)"
+        else:
+            status["x"] = "disabled (set X_ENABLED=true and X_API_BEARER_TOKEN)"
 
     # Delivery channels
     if settings.telegram_bot_token and settings.telegram_chat_id:
@@ -266,6 +275,27 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
                     max_cooldown_seconds=settings.newsapi_rate_limit_max_cooldown_seconds,
                     state_path=settings.newsapi_rate_limit_state_path or None,
                 )
+            )
+
+        # X (Twitter): register as event adapter when enabled + token set.
+        if settings.x_enabled and settings.x_api_bearer_token:
+            ingestion.register_event_adapter(
+                XAPIAdapter(
+                    bearer_token=settings.x_api_bearer_token,
+                    timeout=settings.external_api_timeout_seconds,
+                    query_terms=settings.x_query_terms,
+                    max_requests_per_cycle=settings.x_max_requests_per_cycle,
+                    signal_strength=settings.x_signal_strength,
+                    cooldown_after=settings.x_cooldown_after,
+                    cooldown_seconds=settings.x_cooldown_seconds,
+                    max_cooldown_seconds=settings.x_max_cooldown_seconds,
+                    state_path=settings.x_rate_limit_state_path or None,
+                )
+            )
+        elif settings.x_enabled:
+            logger.warning(
+                "x_adapter_not_registered",
+                reason="X_ENABLED=true but X_API_BEARER_TOKEN is not set",
             )
 
         # SerpAPI trends: adapter is marked SUPPORTED=False (API discontinued).

@@ -111,6 +111,39 @@ Scoring resumes once the news source recovers and fresh narratives are available
 
 ---
 
+## X (Twitter) Rate-Limit Cooldown
+
+The X adapter uses the same exponential-backoff cooldown pattern as NewsAPI.
+When the X API returns HTTP 429, the adapter tracks consecutive failures.
+After `X_COOLDOWN_AFTER` consecutive 429s (default: 2), it enters cooldown.
+
+**Cooldown schedule:**
+
+| Episode | Duration |
+|---------|----------|
+| 1 | 60 s |
+| 2 | 120 s |
+| 3 | 240 s |
+| ... | doubles, capped at 900 s |
+
+**Cooldown persists across restarts.**  The deadline is written to
+`data/x_ratelimit_state.json` (configurable via `X_RATE_LIMIT_STATE_PATH`).
+On restart the adapter reads this file and honours any unexpired deadline.
+To manually clear a stuck cooldown, delete the state file and restart.
+
+**Log to watch:**
+
+```
+x_cooldown_restored_from_state  cooldown_remaining_seconds=... state_path=...
+x_cooldown_active               cooldown_remaining_seconds=... cooldown_episodes=...
+x_entering_cooldown             cooldown_seconds=... cooldown_episode=...
+```
+
+When X is unavailable, the pipeline continues with other sources.
+The cycle summary will include `x_source_available: false`.
+
+---
+
 ## Source Gaps
 
 Source gaps are recorded when an adapter fails to fetch data. View them with:
@@ -141,6 +174,7 @@ Gaps close automatically when the source recovers in the next successful cycle.
 |--------|-------------|
 | `pump.fun` | Pump.fun API rate limit, maintenance, or outage |
 | `newsapi` | API key invalid, quota exceeded, or rate-limit cooldown |
+| `x` | X API bearer token invalid, credit budget exceeded, or rate-limit cooldown |
 | `serpapi_trends` | API key invalid or quota exceeded |
 | `solana_rpc` | RPC endpoint rate limit; switch to a dedicated RPC provider |
 
