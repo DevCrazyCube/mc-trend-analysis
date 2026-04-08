@@ -10,6 +10,8 @@ import {
   Loading,
   ErrorMsg,
 } from '../components/ui'
+import { AudioSettingsPanel } from '../components/AudioSettings'
+import { useAudioAlerts } from '../hooks/useAudioAlerts'
 
 interface FeedItem {
   id: string
@@ -66,9 +68,12 @@ export function LiveFeed() {
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
   const [paused, setPaused] = useState(false)
+  const [showAudioSettings, setShowAudioSettings] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const pausedRef = useRef(paused)
   pausedRef.current = paused
+
+  const { settings: audioSettings, updateSettings: updateAudio, onAlert, testSound } = useAudioAlerts()
 
   // Load recent items on mount
   useEffect(() => {
@@ -103,12 +108,14 @@ export function LiveFeed() {
         setItems(prev => [feedItem(payload, 'token'), ...prev].slice(0, 200))
       } else if (type === 'new_alert') {
         setItems(prev => [feedItem(payload, 'alert'), ...prev].slice(0, 200))
+        // Trigger audio for new alert events only (not historical load)
+        onAlert(payload.alert_id, payload.alert_type)
       } else if (type === 'cycle_complete') {
         // silent refresh hint — handled by other pages
       }
     })
     return () => es.close()
-  }, [])
+  }, [onAlert])
 
   if (loading) return <Loading />
   if (err) return <ErrorMsg msg={err} />
@@ -124,24 +131,53 @@ export function LiveFeed() {
     <div>
       <SectionTitle
         right={
-          <button
-            onClick={() => setPaused(p => !p)}
-            style={{
-              background: paused ? 'rgba(63,185,80,0.15)' : 'rgba(248,81,73,0.15)',
-              color: paused ? '#3fb950' : '#f85149',
-              border: 'none',
-              borderRadius: 4,
-              padding: '4px 12px',
-              cursor: 'pointer',
-              fontSize: 12,
-            }}
-          >
-            {paused ? '▶ Resume' : '⏸ Pause'}
-          </button>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button
+              onClick={() => setShowAudioSettings(p => !p)}
+              style={{
+                background: audioSettings.enabled
+                  ? showAudioSettings
+                    ? 'rgba(88,166,255,0.25)'
+                    : 'rgba(88,166,255,0.1)'
+                  : 'rgba(110,118,129,0.1)',
+                color: audioSettings.enabled ? '#58a6ff' : '#6e7681',
+                border: `1px solid ${audioSettings.enabled ? 'rgba(88,166,255,0.3)' : '#21262d'}`,
+                borderRadius: 4,
+                padding: '4px 10px',
+                cursor: 'pointer',
+                fontSize: 12,
+              }}
+              title="Audio notification settings"
+            >
+              {audioSettings.enabled ? '🔔' : '🔕'} Audio
+            </button>
+            <button
+              onClick={() => setPaused(p => !p)}
+              style={{
+                background: paused ? 'rgba(63,185,80,0.15)' : 'rgba(248,81,73,0.15)',
+                color: paused ? '#3fb950' : '#f85149',
+                border: 'none',
+                borderRadius: 4,
+                padding: '4px 12px',
+                cursor: 'pointer',
+                fontSize: 12,
+              }}
+            >
+              {paused ? '▶ Resume' : '⏸ Pause'}
+            </button>
+          </div>
         }
       >
         Live Feed
       </SectionTitle>
+
+      {showAudioSettings && (
+        <AudioSettingsPanel
+          settings={audioSettings}
+          onUpdate={updateAudio}
+          onTest={testSound}
+        />
+      )}
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
         {['token', 'narrative', 'alert'].map(t => (
