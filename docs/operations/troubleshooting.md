@@ -49,6 +49,68 @@ Check the scored token records and alert types logged at `DEBUG` level.
 
 ---
 
+## NewsAPI Rate-Limit Cooldown
+
+When NewsAPI returns HTTP 429 (Too Many Requests), the adapter enters an
+exponential-backoff cooldown.  During cooldown all fetch calls return empty
+immediately — no HTTP requests are made.
+
+**Cooldown schedule:**
+
+| Episode | Duration |
+|---------|----------|
+| 1 | 60 s |
+| 2 | 120 s |
+| 3 | 240 s |
+| … | doubles, capped at 900 s |
+
+**Cooldown persists across restarts.**  The deadline is written to
+`data/newsapi_ratelimit_state.json` (configurable via
+`NEWSAPI_RATE_LIMIT_STATE_PATH`).  On restart the adapter reads this file and
+honours any unexpired deadline.  To manually clear a stuck cooldown, delete
+the state file and restart.
+
+**Log to watch:**
+
+```
+newsapi_cooldown_restored_from_state  cooldown_remaining_seconds=... state_path=...
+newsapi_cooldown_active               cooldown_remaining_seconds=... cooldown_episodes=...
+newsapi_entering_cooldown             cooldown_seconds=... cooldown_episode=...
+```
+
+**429 is not retried.**  A 429 response triggers cooldown immediately — no
+same-cycle retry attempts.  (Network errors and 5xx responses are still
+retried up to 3 times with backoff.)
+
+---
+
+## Pipeline Degraded Mode (News Source Unavailable)
+
+When NewsAPI is offline or cooling down, the pipeline logs:
+
+```
+pipeline_degraded_mode  reason="newsapi rate-limited (cooldown 240s remaining, episode 2)"
+                        tokens_available=true
+                        hint="Tokens will be ingested but narrative-driven scoring will be zero..."
+```
+
+The cycle summary will show:
+```json
+{
+  "news_source_available": false,
+  "narrative_path_offline": true,
+  "scoring_limited_reason": "newsapi rate-limited (cooldown 240s remaining, episode 2)",
+  "tokens_ingested": 12,
+  "tokens_scored": 0,
+  "competition_outcomes": []
+}
+```
+
+This is expected behaviour.  Tokens continue to be ingested and stored.
+Scoring resumes once the news source recovers and fresh narratives are available.
+
+---
+
 ## Source Gaps
 
 Source gaps are recorded when an adapter fails to fetch data. View them with:
@@ -63,6 +125,14 @@ Or query directly:
 SELECT source_name, started_at, ended_at FROM source_gaps WHERE ended_at IS NULL;
 ```
 
+**Gap lifecycle:**
+- A gap is **opened once** when a source transitions from healthy → unavailable.
+- While the source remains unavailable, no additional gap records are created.
+- The gap is **closed** when the source recovers on the next successful cycle.
+- If the source fails again after recovery, a **new gap** is opened.
+
+This means one continuous outage = exactly one gap record in the database.
+
 Gaps close automatically when the source recovers in the next successful cycle.
 
 ### Common gap causes
@@ -70,7 +140,7 @@ Gaps close automatically when the source recovers in the next successful cycle.
 | Source | Common Cause |
 |--------|-------------|
 | `pump.fun` | Pump.fun API rate limit, maintenance, or outage |
-| `newsapi` | API key invalid or quota exceeded |
+| `newsapi` | API key invalid, quota exceeded, or rate-limit cooldown |
 | `serpapi_trends` | API key invalid or quota exceeded |
 | `solana_rpc` | RPC endpoint rate limit; switch to a dedicated RPC provider |
 

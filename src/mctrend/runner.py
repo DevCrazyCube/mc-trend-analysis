@@ -264,6 +264,7 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
                     cooldown_after=settings.newsapi_rate_limit_cooldown_after,
                     cooldown_seconds=settings.newsapi_rate_limit_cooldown_seconds,
                     max_cooldown_seconds=settings.newsapi_rate_limit_max_cooldown_seconds,
+                    state_path=settings.newsapi_rate_limit_state_path or None,
                 )
             )
 

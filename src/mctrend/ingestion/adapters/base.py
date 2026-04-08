@@ -2,7 +2,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -11,12 +11,38 @@ logger = structlog.get_logger(__name__)
 DEFAULT_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 
-async def retry_fetch(coro_func, source_name: str,
-                      delays: tuple = DEFAULT_RETRY_DELAYS):
+def _is_retryable_default(exc: Exception) -> bool:
+    """Default retryability predicate: retry on anything except HTTP 429.
+
+    HTTP 429 (Too Many Requests) is a quota/rate-limit signal, not a
+    transient transport failure.  Retrying immediately against a rate-limited
+    endpoint wastes quota and delays cooldown entry.  All other exceptions
+    (network errors, timeouts, 5xx) are considered transient and retried.
+    """
+    try:
+        import httpx
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+            return False
+    except ImportError:
+        pass
+    return True
+
+
+async def retry_fetch(
+    coro_func: Callable,
+    source_name: str,
+    delays: tuple = DEFAULT_RETRY_DELAYS,
+    is_retryable: Callable[[Exception], bool] = _is_retryable_default,
+):
     """Retry an async callable up to len(delays)+1 times with exponential backoff.
 
     *coro_func* must be a zero-argument async callable that either returns a
     non-empty list on success or raises an exception on failure.
+
+    *is_retryable* is called with each exception; when it returns False the
+    exception is re-raised immediately without further retry attempts.  The
+    default predicate treats HTTP 429 as non-retryable — rate-limit responses
+    should be handled by the caller's cooldown logic, not retried.
 
     Returns the first successful result, or raises the last exception after all
     attempts are exhausted.
@@ -31,6 +57,14 @@ async def retry_fetch(coro_func, source_name: str,
             return result
         except Exception as e:
             last_exc = e
+            if not is_retryable(e):
+                logger.warning(
+                    "fetch_not_retryable",
+                    source=source_name,
+                    attempt=attempt,
+                    error=str(e),
+                )
+                raise e
             logger.warning("fetch_attempt_failed",
                            source=source_name, attempt=attempt, error=str(e))
             if delay is not None:

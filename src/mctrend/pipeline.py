@@ -159,6 +159,10 @@ class Pipeline:
             "alerts_expired": 0,
             "rows_pruned": 0,
             "errors": [],
+            # Degraded-mode indicators: populated during ingest step
+            "news_source_available": True,
+            "narrative_path_offline": False,
+            "scoring_limited_reason": None,
         }
 
         # Step 1: Ingest
@@ -166,9 +170,16 @@ class Pipeline:
             raw_tokens = await self.ingestion.fetch_tokens()
             raw_events = await self.ingestion.fetch_events()
 
-            # Record source gaps; close any that recovered
+            # Record source gaps — deduplicated against the DB so that a
+            # restart does not re-open a gap that is already tracked there.
+            existing_open_gap_sources = {
+                g["source_name"] for g in self.gap_repo.get_open_gaps()
+            }
             for gap in self.ingestion.get_pending_gaps():
-                self.gap_repo.open_gap(gap)
+                if gap["source_name"] not in existing_open_gap_sources:
+                    self.gap_repo.open_gap(gap)
+                    existing_open_gap_sources.add(gap["source_name"])
+                # else: gap already open in DB for this source — do not duplicate
 
             now_iso = datetime.now(timezone.utc).isoformat()
             cooldown_count = 0
@@ -180,7 +191,40 @@ class Pipeline:
                     if closed:
                         logger.info("source_gap_closed",
                                     source=source_name, gaps_closed=closed)
+                        # Inform manager so it allows a fresh gap if source fails again
+                        self.ingestion.mark_source_recovered(source_name)
             summary["source_cooldown_active"] = cooldown_count
+
+            # Degraded-mode detection: check whether the news/narrative path is live.
+            # A news source is considered offline when it is unhealthy OR in rate-limit
+            # cooldown (both result in zero articles this cycle).
+            source_health = self.ingestion.get_source_health()
+            news_meta = source_health.get("newsapi", {})
+            news_healthy = news_meta.get("healthy", True)
+            news_in_cooldown = news_meta.get("in_rate_limit_cooldown", False)
+            news_available = bool(news_meta) and news_healthy and not news_in_cooldown
+            # If no news adapter is registered at all, treat as "no news source" —
+            # not an outage, just unconfigured.  Only set offline when a source
+            # is registered but degraded.
+            if news_meta and not news_available:
+                summary["news_source_available"] = False
+                if news_in_cooldown:
+                    remaining = news_meta.get("cooldown_remaining_seconds", 0)
+                    reason = (
+                        f"newsapi rate-limited (cooldown {remaining:.0f}s remaining, "
+                        f"episode {news_meta.get('cooldown_episodes', '?')})"
+                    )
+                else:
+                    reason = "newsapi unhealthy"
+                summary["narrative_path_offline"] = True
+                summary["scoring_limited_reason"] = reason
+                logger.warning(
+                    "pipeline_degraded_mode",
+                    reason=reason,
+                    tokens_available=len(raw_tokens) > 0,
+                    hint="Tokens will be ingested but narrative-driven scoring will be zero until news source recovers.",
+                )
+
         except Exception as e:
             logger.error("pipeline_ingest_error", error=str(e))
             summary["errors"].append(f"ingest: {e}")

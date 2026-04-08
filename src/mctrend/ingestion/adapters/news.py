@@ -1,8 +1,10 @@
 """News source adapter for narrative detection."""
+import os
 import time
 import httpx
 from datetime import datetime, timezone
 from .base import SourceAdapter, logger, retry_fetch
+from .ratelimit_state import RateLimitState, load_state_for_adapter
 
 _DEFAULT_QUERY_TERMS = [
     "solana token launch",
@@ -15,15 +17,27 @@ _DEFAULT_QUERY_TERMS = [
 class NewsAPIAdapter(SourceAdapter):
     """Fetch trending news from NewsAPI.org for narrative detection.
 
-    Includes per-source rate-limit cooldown: after ``cooldown_after`` consecutive
-    HTTP 429 responses the adapter stops making requests for ``cooldown_seconds``
-    (with exponential backoff per episode, capped at ``max_cooldown_seconds``).
+    **Rate-limit cooldown**
 
-    **Cooldown Persistence:** Cooldown state is NOT persisted across process restarts.
-    The cooldown uses process-local ``time.monotonic()`` timestamps, so each process
-    restart resets the cooldown state. This is by design for stateless/cloud-native
-    deployments: if the rate limit is still active, the adapter will quickly re-enter
-    cooldown after the first 429 response.
+    After ``cooldown_after`` consecutive HTTP 429 responses the adapter
+    enters an exponential-backoff cooldown (base ``cooldown_seconds``,
+    capped at ``max_cooldown_seconds``).  During cooldown every call to
+    ``fetch()`` returns ``[]`` immediately without making any HTTP requests.
+
+    Note: a 429 is treated as non-retryable by ``retry_fetch``.  The
+    adapter enters cooldown after the *first* 429 in a cycle rather than
+    exhausting all retry attempts first.
+
+    **Cooldown persistence across restarts**
+
+    When ``state_path`` is provided the cooldown deadline is written to
+    disk in wall-clock UTC time whenever cooldown is entered.  On startup
+    the file is read and, if the deadline is still in the future, the
+    adapter begins in cooldown — preventing an immediate hammer of the
+    rate-limited API on restart.
+
+    When ``state_path`` is empty or None (default) persistence is disabled
+    and cooldown resets on every process restart.
     """
 
     def __init__(
@@ -37,6 +51,7 @@ class NewsAPIAdapter(SourceAdapter):
         cooldown_after: int = 2,
         cooldown_seconds: float = 60.0,
         max_cooldown_seconds: float = 900.0,
+        state_path: str | os.PathLike | None = None,
     ):
         super().__init__(source_name="newsapi", source_type="news")
         self.api_key = api_key
@@ -45,15 +60,38 @@ class NewsAPIAdapter(SourceAdapter):
         self.query_terms = query_terms or _DEFAULT_QUERY_TERMS
         self.page_size = page_size
         self.signal_strength = signal_strength
-        self.domains = domains  # comma-separated domain filter (e.g. "coindesk.com")
+        self.domains = domains
 
-        # Rate-limit cooldown state
+        # Rate-limit cooldown policy
         self._cooldown_after = cooldown_after
         self._cooldown_seconds = cooldown_seconds
         self._max_cooldown_seconds = max_cooldown_seconds
-        self._consecutive_429s = 0
-        self._cooldown_episodes = 0       # number of cooldown periods entered
-        self._cooldown_until: float = 0.0  # monotonic timestamp; 0 = not in cooldown
+
+        # Persistent state (None when persistence is disabled)
+        self._state_path = state_path
+        self._persisted: RateLimitState | None = load_state_for_adapter(
+            state_path, source_name="newsapi"
+        )
+
+        # Process-local state (monotonic clock for efficiency)
+        # Initialise from persisted state if it shows remaining cooldown.
+        self._consecutive_429s: int = 0
+        self._cooldown_episodes: int = 0
+        self._cooldown_until: float = 0.0  # monotonic timestamp
+
+        if self._persisted is not None:
+            self._consecutive_429s = self._persisted.consecutive_429s
+            self._cooldown_episodes = self._persisted.cooldown_episodes
+            remaining = self._persisted.cooldown_remaining_seconds()
+            if remaining > 0.0:
+                self._cooldown_until = time.monotonic() + remaining
+                self._healthy = False
+                logger.warning(
+                    "newsapi_cooldown_restored_from_state",
+                    cooldown_remaining_seconds=round(remaining, 1),
+                    cooldown_episodes=self._cooldown_episodes,
+                    state_path=str(state_path),
+                )
 
         self._client: httpx.AsyncClient | None = None
 
@@ -71,6 +109,7 @@ class NewsAPIAdapter(SourceAdapter):
         meta["consecutive_429s"] = self._consecutive_429s
         remaining = max(0.0, self._cooldown_until - time.monotonic())
         meta["cooldown_remaining_seconds"] = round(remaining, 1) if remaining > 0 else 0.0
+        meta["cooldown_episodes"] = self._cooldown_episodes
         return meta
 
     async def fetch(self) -> list[dict]:
@@ -79,13 +118,14 @@ class NewsAPIAdapter(SourceAdapter):
             logger.debug("newsapi_skipped_no_key")
             return []
 
-        # Honour rate-limit cooldown: skip fetch silently during cooldown period
+        # Honour rate-limit cooldown: skip fetch without HTTP calls
         if self.is_in_cooldown():
             remaining = round(self._cooldown_until - time.monotonic(), 1)
             logger.info(
                 "newsapi_cooldown_active",
                 cooldown_remaining_seconds=remaining,
                 consecutive_429s=self._consecutive_429s,
+                cooldown_episodes=self._cooldown_episodes,
             )
             return []
 
@@ -108,12 +148,14 @@ class NewsAPIAdapter(SourceAdapter):
                     r.raise_for_status()
                     return r.json().get("articles", [])
 
+                # retry_fetch will re-raise 429 immediately (non-retryable)
                 articles = await retry_fetch(_do_fetch, self.source_name)
                 all_articles.extend(articles)
 
-            # Successful fetch: reset 429 counter
+            # Successful fetch: reset 429 counter and persist cleared state
             self._consecutive_429s = 0
             self._mark_healthy()
+            self._persist_state(cleared=True)
 
             # Normalize and deduplicate by title
             events = []
@@ -147,7 +189,7 @@ class NewsAPIAdapter(SourceAdapter):
     # ------------------------------------------------------------------
 
     def _handle_429(self) -> None:
-        """Record a 429 response and enter cooldown if threshold is reached."""
+        """Record a 429 response and enter cooldown immediately."""
         self._consecutive_429s += 1
         self._mark_unhealthy("HTTP 429 Too Many Requests")
         logger.warning(
@@ -167,6 +209,34 @@ class NewsAPIAdapter(SourceAdapter):
                 cooldown_seconds=round(duration, 1),
                 cooldown_episode=self._cooldown_episodes,
             )
+            self._persist_state(duration_seconds=duration)
+        else:
+            # Not yet at threshold: persist updated consecutive count
+            self._persist_state()
+
+    def _persist_state(
+        self,
+        duration_seconds: float | None = None,
+        cleared: bool = False,
+    ) -> None:
+        """Write current rate-limit state to disk.
+
+        *duration_seconds*: when set, calls ``enter_cooldown`` on the stored
+        state before saving (used when a new cooldown episode begins).
+        *cleared*: when True, resets persisted state (successful recovery).
+        """
+        if self._persisted is None or not self._state_path:
+            return
+        self._persisted.consecutive_429s = self._consecutive_429s
+        self._persisted.cooldown_episodes = self._cooldown_episodes
+        if cleared:
+            self._persisted.reset()
+        elif duration_seconds is not None:
+            self._persisted.enter_cooldown(duration_seconds)
+        try:
+            self._persisted.save(self._state_path)
+        except Exception as exc:
+            logger.warning("newsapi_state_persist_failed", error=str(exc))
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:

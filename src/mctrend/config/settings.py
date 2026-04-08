@@ -499,6 +499,15 @@ class Settings(BaseModel):
         900.0, gt=0,
         description="Maximum cooldown duration in seconds (caps exponential growth)",
     )
+    newsapi_rate_limit_state_path: str = Field(
+        "data/newsapi_ratelimit_state.json",
+        description=(
+            "Path to the JSON file that persists NewsAPI rate-limit state across restarts. "
+            "On startup the adapter reads this file and honours any unexpired cooldown "
+            "deadline — preventing an immediate 429 hammer after a restart. "
+            "Set to empty string '' to disable persistence (cooldown resets on restart)."
+        ),
+    )
     trends_geo: str = Field("US", description="Geographic filter for Google Trends adapter")
     trends_signal_strength: float = Field(
         0.7, ge=0.0, le=1.0, description="Default signal strength for trend events"
@@ -700,5 +709,9 @@ class Settings(BaseModel):
                     "ALERT_HISTORY_MAX_ENTRIES",
                     cls.model_fields["alert_history_max_entries"].default,
                 )
+            ),
+            newsapi_rate_limit_state_path=env.get(
+                "NEWSAPI_RATE_LIMIT_STATE_PATH",
+                cls.model_fields["newsapi_rate_limit_state_path"].default,
             ),
         )
