@@ -108,6 +108,9 @@ class Pipeline:
                 dead_timeout_minutes=ni.dead_timeout_minutes,
                 winner_min_strength=ni.winner_min_strength,
                 token_competition_margin=ni.token_competition_margin,
+                cluster_term_overlap_pct=ni.cluster_term_overlap_pct,
+                cluster_token_overlap_min=ni.cluster_token_overlap_min,
+                cluster_min_source_diversity=ni.cluster_min_source_diversity,
             )
         self.narrative_intel = NarrativeIntelligence(ni_cfg)
 
@@ -225,6 +228,29 @@ class Pipeline:
             summary["errors"].append(f"narrative_eval: {e}")
 
         summary["narratives_evaluated"] = narratives_evaluated
+
+        # Step 3.6: Cluster narratives for valid competition grouping
+        try:
+            scoring_narratives = self.narrative_repo.get_for_scoring()
+            if scoring_narratives:
+                # Build token_links map for token-overlap clustering
+                narr_token_links: dict[str, list[str]] = {}
+                for narr in scoring_narratives:
+                    nid = narr.get("narrative_id", "")
+                    links_for_narr = self.link_repo.get_active_for_narrative(nid)
+                    narr_token_links[nid] = [
+                        lnk["token_id"] for lnk in links_for_narr
+                    ]
+
+                cluster_map = self.narrative_intel.cluster_narratives(
+                    scoring_narratives, narr_token_links,
+                )
+                # Persist cluster_id on narratives
+                for nid, cid in cluster_map.items():
+                    self.narrative_repo.update_fields(nid, {"cluster_id": cid})
+        except Exception as e:
+            logger.error("pipeline_clustering_error", error=str(e))
+            summary["errors"].append(f"clustering: {e}")
 
         # Step 4: Correlate tokens with narratives
         # Use scoring-eligible narratives for correlation (EMERGING, RISING, TRENDING)
@@ -373,14 +399,11 @@ class Pipeline:
         summary["quality_gated"] = quality_gated_count
         self._total_tokens_processed += scored_count
 
-        # Step 5.5: Competition layer — select token winners within each narrative
-        # and apply alert gating based on narrative state.
-        # Check if any narratives are RISING+ for alert fallback logic.
-        has_rising = any(
-            items[0]["narrative"].get("state") in ("RISING", "TRENDING")
-            for items in narrative_scored_tokens.values()
-            if items
-        )
+        # Step 5.5: Competition layer — strict winner-takes-all.
+        # No fallback: only RISING+ narratives may produce alerts.
+        # Only rank-1 token per narrative proceeds to alert classification.
+        # All others are suppressed with structured reasons.
+        suppressed_count = 0
 
         for nid, items in narrative_scored_tokens.items():
             # Token competition: rank tokens within this narrative
@@ -402,30 +425,42 @@ class Pipeline:
                 narrative = item["narrative"]
                 link = item["link"]
                 competition_status = entry.get("token_competition_status", "winner")
+                suppression_reasons = entry.get("suppression_reasons", [])
 
-                # Alert gating: narrative must be alert-eligible
-                if not self.narrative_intel.is_alert_eligible(narrative, has_rising):
+                # Alert gating: narrative must be RISING+ (strict, no fallback)
+                if not self.narrative_intel.is_alert_eligible(narrative):
+                    narr_reasons = self.narrative_intel.get_suppression_reasons(narrative)
                     logger.info(
                         "alert_narrative_gate_failed",
                         token_id=token.get("token_id"),
                         narrative_id=narrative.get("narrative_id"),
                         narrative_state=narrative.get("state"),
+                        suppression_reasons=[r["code"] for r in narr_reasons],
                     )
-                    self._handle_rejection(scored, token, narrative)
+                    self._handle_rejection(
+                        scored, token, narrative,
+                        extra_reasons=narr_reasons,
+                    )
+                    suppressed_count += 1
                     continue
 
-                # Token must be winner or within margin
-                if competition_status == "suppressed":
+                # Strict winner-takes-all: only "winner" proceeds
+                if competition_status != "winner":
                     logger.info(
-                        "token_outcompeted",
+                        "token_suppressed",
                         token_id=token.get("token_id"),
                         narrative_id=narrative.get("narrative_id"),
                         competition_status=competition_status,
+                        suppression_reasons=[r["code"] for r in suppression_reasons],
                     )
-                    self._handle_rejection(scored, token, narrative)
+                    self._handle_rejection(
+                        scored, token, narrative,
+                        extra_reasons=suppression_reasons,
+                    )
+                    suppressed_count += 1
                     continue
 
-                # Step 6: Alert classification
+                # Step 6: Alert classification — only the single winner reaches here
                 alert = self.alert_engine.process_scored_token(
                     scored_token=scored,
                     token=token,
@@ -449,6 +484,8 @@ class Pipeline:
                     )
                 else:
                     self._handle_rejection(scored, token, narrative)
+
+        summary["suppressed"] = suppressed_count
 
         # Step 8: Expire stale alerts and retire old ones
         try:
@@ -532,12 +569,19 @@ class Pipeline:
         scored: dict,
         token: dict,
         narrative: dict,
+        extra_reasons: list[dict] | None = None,
     ) -> None:
         """Log and persist a structured rejection record for a token classified as ignore.
 
-        Called when process_scored_token returns None (alert_type == "ignore",
-        no prior alert).  Produces a per-tier breakdown of which thresholds were
-        not met so the operator can tune thresholds instead of guessing.
+        Called when a token is suppressed by competition, narrative gating,
+        or alert classification.  Produces a per-tier breakdown of which
+        thresholds were not met so the operator can tune thresholds.
+
+        Parameters
+        ----------
+        extra_reasons
+            Additional structured suppression reasons (e.g., from competition
+            layer or narrative gating) to merge into the rejection record.
         """
         net_potential = scored.get("net_potential", 0.0) or 0.0
         p_potential = scored.get("p_potential", 0.0) or 0.0
@@ -545,7 +589,7 @@ class Pipeline:
         confidence = scored.get("confidence_score", 0.0) or 0.0
         risk_flags = scored.get("risk_flags") or []
         data_gaps = scored.get("data_gaps") or []
-        narrative_state = narrative.get("state", "EMERGING")
+        narrative_state = narrative.get("state", "WEAK")
         watch_min = self.alert_engine.thresholds.watch_min_net_potential
 
         reasons = explain_rejection(
@@ -558,6 +602,10 @@ class Pipeline:
             data_gaps=data_gaps,
             thresholds=self.alert_engine.thresholds,
         )
+
+        # Merge suppression reasons from competition/gating layer
+        if extra_reasons:
+            reasons.extend(extra_reasons)
 
         watch_gap = round(watch_min - net_potential, 4)
 

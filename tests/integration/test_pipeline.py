@@ -48,7 +48,10 @@ class TestPipelineIntegration:
         tokens = pipeline.token_repo.list_by_status("new")
         assert len(tokens) >= 3  # At least DEEPMIND, MOONDOG, BRAVADO
 
-        narratives = pipeline.narrative_repo.get_active(states=["EMERGING"])
+        # After intelligence evaluation, narratives should be EMERGING or higher
+        narratives = pipeline.narrative_repo.get_active(
+            states=["EMERGING", "RISING", "TRENDING"]
+        )
         assert len(narratives) >= 3
 
         db.close()

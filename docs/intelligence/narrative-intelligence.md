@@ -157,19 +157,23 @@ Narratives must meet minimum quality thresholds before they can influence token 
 
 ---
 
-## 5. Narrative Clustering (De-duplication)
+## 5. Narrative Clustering (De-duplication) — Critical for Valid Competition
 
 ### Problem
 
-Multiple narratives about the same topic may exist with different anchor terms or phrasings. This fragments signal strength.
+Multiple narratives about the same topic may exist with different anchor terms or phrasings. This fragments signal strength. **If clustering is weak, competition becomes invalid and incorrect winners will be selected.**
 
 ### Approach
 
-Deterministic clustering using anchor term overlap and shared token links:
+Multi-signal deterministic clustering using union-find:
 
-1. **Term Overlap**: Two narratives share >= 50% of their anchor terms (case-insensitive).
-2. **Token Overlap**: Two narratives have >= 2 tokens linked to both.
-3. **Explicit Merge**: During `merge_narratives`, if an incoming event matches an existing narrative by anchor terms, merge rather than create.
+1. **Anchor Term Overlap**: Two narratives share >= `cluster_term_overlap_pct` (default 50%) of their anchor terms (case-insensitive).
+2. **Broad Term Overlap**: Anchor + related terms overlap >= `cluster_term_overlap_pct`.
+3. **Entity Overlap**: Two narratives share >= 1 named entity (name + type match).
+4. **Token Overlap**: Two narratives have >= `cluster_token_overlap_min` (default 2) tokens linked to both.
+5. **Explicit Merge**: During `merge_narratives`, if an incoming event matches an existing narrative by anchor terms, merge rather than create.
+
+Clustering is re-computed each cycle via union-find to handle evolving relationships.
 
 ### Cluster Behavior
 
@@ -217,17 +221,48 @@ Within the winner narrative's linked tokens:
 
 ---
 
-## 7. Alert Gating (Final Layer)
+## 7. Alert Gating (Final Layer) — Strict, No Fallback
 
 Alerts fire only when ALL of the following are true:
 
-1. Token is linked to a narrative with state >= RISING (or EMERGING if no RISING+ narratives exist in this cycle).
-2. The narrative is the winner of its competitive group (or has no competition).
-3. The token is the winner token within its narrative (or is within margin of the winner).
+1. Token is linked to a narrative with state **RISING or TRENDING**. No fallback to EMERGING. If no narrative is RISING+, the system emits **zero alerts**. This is expected behavior, not a failure.
+2. The narrative is the **sole winner** of its competitive group. Outcompeted narratives never produce alerts.
+3. The token is the **#1 ranked token** within its narrative. All other tokens are suppressed. There is no "within margin" pass-through — strict winner-takes-all.
 4. Standard alert threshold checks pass (net_potential, p_failure, confidence).
 
-If condition 1 or 2 fails: no alert, reason logged as `narrative_quality_gate_failed`.
-If condition 3 fails: no alert, reason logged as `token_outcompeted`.
+If condition 1 fails: no alert, suppression reason `narrative_state_too_low`.
+If condition 2 fails: no alert, suppression reason `lost_to_stronger_narrative` + `not_top_in_cluster`.
+If condition 3 fails: no alert, suppression reason `lost_to_stronger_token`.
+
+### Suppression Reason Codes
+
+Every suppressed narrative or token carries structured, machine-readable reasons:
+
+| Code | Meaning |
+|---|---|
+| `lost_to_stronger_narrative` | Another narrative in the same cluster had higher strength |
+| `lost_to_stronger_token` | Another token in the same narrative had higher net_potential |
+| `below_min_strength` | Narrative strength below `winner_min_strength` |
+| `below_min_velocity` | Narrative velocity is stalled (no events in window) |
+| `insufficient_source_count` | Fewer than `min_sources` sources |
+| `insufficient_source_diversity` | Fewer than `cluster_min_source_diversity` source types |
+| `not_top_in_cluster` | Not rank 1 in cluster competition |
+| `winner_margin_not_met` | Within margin of winner but strict winner-takes-all enforced |
+| `narrative_state_too_low` | State is below RISING (WEAK, EMERGING, FADING) |
+| `narrative_dead` | Narrative is in terminal DEAD state |
+| `narrative_fading` | Narrative is declining |
+
+These are stored in the `rejected_candidates` table and exposed in the dashboard.
+
+### Winner Transparency
+
+Every selected winner (narrative and token) includes a full explanation:
+
+- **Strength breakdown**: source_count, velocity, recency, diversity contributions
+- **Velocity and trend**: current velocity, velocity_state
+- **Source metrics**: count, diversity, types
+- **Cluster context**: cluster size, rank position
+- **Runner-up comparison**: strength difference, margin of victory
 
 ---
 
@@ -270,11 +305,24 @@ Every state transition, every competition result, and every quality gate rejecti
 
 ---
 
+## 10. Silence Over Weak Signals
+
+The system must prefer no output over low-confidence output. Observable cycles with zero alerts and zero winners are expected behavior, not failure conditions.
+
+- If no narrative reaches RISING: zero alerts. No fallback.
+- If no token meets scoring thresholds: zero alerts. No runner-up promotion.
+- If all narratives are WEAK or FADING: zero alerts. The system waits.
+
+The system tolerates inactivity rather than emitting weak signals.
+
+---
+
 ## What This System Is Not
 
 - Not an LLM-powered topic detector (deterministic only)
 - Not a social media sentiment analyzer
 - Not a prediction of narrative longevity
 - Not a guarantee that the winning narrative/token is profitable
+- Not a system that will always produce output — silence is a valid state
 
-This is a **signal quality filter**. It separates strong, reinforced, accelerating signals from noise. The scoring model and alert classifier downstream decide what to do with the survivors.
+This is a **strict selection engine** — a competitive filtering system with enforced dominance. At any moment, only the strongest signal survives, all others are explicitly suppressed and explained, and weak signals are discarded, not surfaced.

@@ -189,7 +189,19 @@ class NarrativeIntelligenceConfig(BaseModel):
         0.30, ge=0.0, le=1.0, description="Minimum strength for a narrative to win competition"
     )
     token_competition_margin: float = Field(
-        0.05, ge=0.0, le=1.0, description="Score margin within which tokens are not suppressed"
+        0.05, ge=0.0, le=1.0,
+        description="Score margin a non-winner must EXCEED the winner by to override suppression",
+    )
+
+    # Clustering
+    cluster_term_overlap_pct: float = Field(
+        0.50, ge=0.0, le=1.0, description="Min fraction of anchor terms shared to cluster"
+    )
+    cluster_token_overlap_min: int = Field(
+        2, ge=1, description="Min shared linked tokens to cluster two narratives"
+    )
+    cluster_min_source_diversity: int = Field(
+        1, ge=1, description="Min distinct source types for a narrative"
     )
 
     @model_validator(mode="after")

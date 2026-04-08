@@ -355,8 +355,10 @@ def inject_demo_data(pipeline: Pipeline):
         },
     ]
 
-    # Second-source confirmations to meet min_sources threshold for EMERGING
+    # Additional source confirmations — multiple sources with diverse types
+    # needed to reach RISING state (accelerating velocity + strength >= 0.35).
     confirmations = [
+        # Second sources
         {
             "anchor_terms": ["DEEPMIND", "GOOGLE", "AI"],
             "source_type": "search_trends",
@@ -378,6 +380,28 @@ def inject_demo_data(pipeline: Pipeline):
             "signal_strength": 0.70,
             "published_at": now.isoformat(),
         },
+        # Third sources (different type for diversity boost)
+        {
+            "anchor_terms": ["DEEPMIND", "GOOGLE", "AI"],
+            "source_type": "twitter",
+            "source_name": "demo_twitter",
+            "signal_strength": 0.82,
+            "published_at": now.isoformat(),
+        },
+        {
+            "anchor_terms": ["MOONDOG", "SPACE", "DOG"],
+            "source_type": "twitter",
+            "source_name": "demo_twitter",
+            "signal_strength": 0.77,
+            "published_at": now.isoformat(),
+        },
+        {
+            "anchor_terms": ["BRAVADO", "BOXING", "CHAMPION"],
+            "source_type": "twitter",
+            "source_name": "demo_twitter",
+            "signal_strength": 0.68,
+            "published_at": now.isoformat(),
+        },
     ]
 
     for raw_event in narratives:
@@ -385,7 +409,7 @@ def inject_demo_data(pipeline: Pipeline):
         if normalized:
             pipeline.narrative_repo.save(normalized)
 
-    # Merge second sources into existing narratives (provides multi-source confirmation)
+    # Merge additional sources into existing narratives
     for conf in confirmations:
         existing = pipeline._find_matching_narrative(
             [t.strip().upper() for t in conf["anchor_terms"]]
@@ -394,15 +418,20 @@ def inject_demo_data(pipeline: Pipeline):
             merged = merge_narratives(existing, conf)
             pipeline.narrative_repo.save(merged)
 
-    # Run narrative intelligence evaluation so narratives reach EMERGING+
+    # Run narrative intelligence evaluation twice:
+    # Pass 1: establishes baseline velocity (velocity_delta=0 → EMERGING)
+    # Pass 2: sees acceleration from previous velocity → can reach RISING
     from mctrend.narrative.intelligence import NarrativeConfig, NarrativeIntelligence
 
     ni = getattr(pipeline, "narrative_intel", NarrativeIntelligence(NarrativeConfig()))
-    all_narrs = pipeline.narrative_repo.get_active()
-    for narr in all_narrs:
-        updates = ni.transition_narrative(narr, now)
-        if updates:
-            pipeline.narrative_repo.update_fields(narr["narrative_id"], updates)
+    for _pass in range(2):
+        all_narrs = pipeline.narrative_repo.get_active()
+        for narr in all_narrs:
+            updates = ni.transition_narrative(narr, now)
+            if updates:
+                pipeline.narrative_repo.update_fields(narr["narrative_id"], updates)
+                # Re-read to get updated fields for next iteration
+                narr.update(updates)
 
     # Create tokens that match these narratives
     tokens = [

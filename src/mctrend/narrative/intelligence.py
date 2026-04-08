@@ -1,9 +1,16 @@
 """Core narrative intelligence engine.
 
 Computes velocity, strength, manages lifecycle state machine, quality gating,
-and competition/winner selection.
+competition/winner selection, clustering, and suppression diagnostics.
 
 Reference: docs/intelligence/narrative-intelligence.md
+
+Design principles:
+  - No fallback behavior: alerts require RISING+ narratives, period.
+  - Strict winner-takes-all: one winner per group, all others suppressed.
+  - Every suppression has a machine-readable reason.
+  - Every winner has a full justification breakdown.
+  - Silence is preferred over weak signals.
 
 All thresholds are configurable via NarrativeConfig (no hardcoded values).
 """
@@ -16,6 +23,23 @@ from datetime import datetime, timezone
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Suppression reason codes (machine-readable, stored in database)
+# ---------------------------------------------------------------------------
+
+SUPPRESSION_LOST_TO_STRONGER_NARRATIVE = "lost_to_stronger_narrative"
+SUPPRESSION_LOST_TO_STRONGER_TOKEN = "lost_to_stronger_token"
+SUPPRESSION_BELOW_MIN_STRENGTH = "below_min_strength"
+SUPPRESSION_BELOW_MIN_VELOCITY = "below_min_velocity"
+SUPPRESSION_INSUFFICIENT_SOURCE_COUNT = "insufficient_source_count"
+SUPPRESSION_INSUFFICIENT_SOURCE_DIVERSITY = "insufficient_source_diversity"
+SUPPRESSION_NOT_TOP_IN_CLUSTER = "not_top_in_cluster"
+SUPPRESSION_WINNER_MARGIN_NOT_MET = "winner_margin_not_met"
+SUPPRESSION_NARRATIVE_STATE_TOO_LOW = "narrative_state_too_low"
+SUPPRESSION_NARRATIVE_DEAD = "narrative_dead"
+SUPPRESSION_NARRATIVE_FADING = "narrative_fading"
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +81,11 @@ class NarrativeConfig:
     winner_min_strength: float = 0.30
     token_competition_margin: float = 0.05
 
+    # Clustering thresholds
+    cluster_term_overlap_pct: float = 0.50
+    cluster_token_overlap_min: int = 2
+    cluster_min_source_diversity: int = 1
+
 
 # ---------------------------------------------------------------------------
 # Velocity states
@@ -82,11 +111,9 @@ LIFECYCLE_MERGED = "MERGED"
 # Scoring-eligible states
 SCORING_ELIGIBLE_STATES = frozenset({LIFECYCLE_EMERGING, LIFECYCLE_RISING, LIFECYCLE_TRENDING})
 
-# Alert-eligible states (narratives must be at least this strong for alerts)
+# Alert-eligible states — RISING or higher, NO fallback.
+# If no narrative meets this bar, the system emits nothing. This is by design.
 ALERT_ELIGIBLE_STATES = frozenset({LIFECYCLE_RISING, LIFECYCLE_TRENDING})
-
-# Fallback: if no RISING+ narratives exist, allow EMERGING
-ALERT_FALLBACK_STATES = frozenset({LIFECYCLE_EMERGING, LIFECYCLE_RISING, LIFECYCLE_TRENDING})
 
 
 # ---------------------------------------------------------------------------
@@ -363,16 +390,14 @@ class NarrativeIntelligence:
 
         return True
 
-    def is_alert_eligible(self, narrative: dict, has_rising_narratives: bool = True) -> bool:
+    def is_alert_eligible(self, narrative: dict) -> bool:
         """Whether a narrative is strong enough for alert generation.
 
-        If has_rising_narratives is True (there exist RISING+ narratives in
-        this cycle), require RISING or higher.  Otherwise fall back to EMERGING.
+        Strict rule: RISING or TRENDING only. No fallback to EMERGING.
+        If no narrative meets this bar, the system emits nothing.
         """
         state = narrative.get("state", LIFECYCLE_WEAK)
-        if has_rising_narratives:
-            return state in ALERT_ELIGIBLE_STATES
-        return state in ALERT_FALLBACK_STATES
+        return state in ALERT_ELIGIBLE_STATES
 
     def get_rejection_reason(self, narrative: dict) -> str | None:
         """Return a human-readable reason why a narrative is not scoring-eligible, or None."""
@@ -394,6 +419,188 @@ class NarrativeIntelligence:
             return "narrative_fading"
         return None
 
+    def get_suppression_reasons(self, narrative: dict) -> list[dict]:
+        """Return structured, machine-readable suppression reasons for a narrative.
+
+        Each reason is a dict with: code, actual, threshold, detail.
+        Returns an empty list if the narrative has no suppression reasons.
+        """
+        reasons: list[dict] = []
+        state = narrative.get("state", LIFECYCLE_WEAK)
+        sources = narrative.get("sources") or []
+        strength = narrative.get("narrative_strength", 0.0) or 0.0
+        velocity = narrative.get("narrative_velocity", 0.0) or 0.0
+        velocity_state = narrative.get("velocity_state", "stalled")
+        source_types = {s.get("source_type") for s in sources if s.get("source_type")}
+
+        if state == LIFECYCLE_DEAD:
+            reasons.append({
+                "code": SUPPRESSION_NARRATIVE_DEAD,
+                "actual": state,
+                "threshold": "non-terminal",
+                "detail": "Narrative is dead and cannot generate alerts",
+            })
+            return reasons
+
+        if state == LIFECYCLE_FADING:
+            reasons.append({
+                "code": SUPPRESSION_NARRATIVE_FADING,
+                "actual": state,
+                "threshold": "RISING+",
+                "detail": "Narrative is fading and below alert threshold",
+            })
+
+        if state not in ALERT_ELIGIBLE_STATES:
+            reasons.append({
+                "code": SUPPRESSION_NARRATIVE_STATE_TOO_LOW,
+                "actual": state,
+                "threshold": "RISING or TRENDING",
+                "detail": f"State {state} is below alert eligibility (RISING+)",
+            })
+
+        if len(sources) < self.cfg.min_sources:
+            reasons.append({
+                "code": SUPPRESSION_INSUFFICIENT_SOURCE_COUNT,
+                "actual": len(sources),
+                "threshold": self.cfg.min_sources,
+                "detail": f"{len(sources)} sources < minimum {self.cfg.min_sources}",
+            })
+
+        if strength < self.cfg.winner_min_strength:
+            reasons.append({
+                "code": SUPPRESSION_BELOW_MIN_STRENGTH,
+                "actual": round(strength, 4),
+                "threshold": self.cfg.winner_min_strength,
+                "detail": f"strength {strength:.4f} < winner minimum {self.cfg.winner_min_strength}",
+            })
+
+        if velocity == 0.0 or velocity_state == VELOCITY_STALLED:
+            reasons.append({
+                "code": SUPPRESSION_BELOW_MIN_VELOCITY,
+                "actual": round(velocity, 6),
+                "threshold": "> 0",
+                "detail": f"velocity {velocity:.6f} is stalled (no events in window)",
+            })
+
+        if len(source_types) < self.cfg.cluster_min_source_diversity:
+            reasons.append({
+                "code": SUPPRESSION_INSUFFICIENT_SOURCE_DIVERSITY,
+                "actual": len(source_types),
+                "threshold": self.cfg.cluster_min_source_diversity,
+                "detail": f"{len(source_types)} source types < minimum {self.cfg.cluster_min_source_diversity}",
+            })
+
+        return reasons
+
+    # ------------------------------------------------------------------
+    # Clustering
+    # ------------------------------------------------------------------
+
+    def cluster_narratives(
+        self,
+        narratives: list[dict],
+        token_links: dict[str, list[str]] | None = None,
+    ) -> dict[str, str]:
+        """Deterministic narrative clustering based on term overlap and token overlap.
+
+        Parameters
+        ----------
+        narratives
+            List of narrative dicts with narrative_id, anchor_terms, related_terms.
+        token_links
+            Optional mapping of narrative_id -> list of token_ids linked to it.
+            Used for token-overlap clustering.
+
+        Returns
+        -------
+        dict[str, str]
+            Mapping of narrative_id -> cluster_id.  Narratives in the same cluster
+            share the same cluster_id (the narrative_id of the first member found).
+        """
+        if not narratives:
+            return {}
+
+        if token_links is None:
+            token_links = {}
+
+        # Build a union-find for clustering
+        parent: dict[str, str] = {}
+
+        def find(x: str) -> str:
+            while parent.get(x, x) != x:
+                parent[x] = parent.get(parent[x], parent[x])
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for n in narratives:
+            nid = n.get("narrative_id", "")
+            parent[nid] = nid
+
+        # 1. Term overlap: >= cluster_term_overlap_pct of anchor terms shared
+        for i, n1 in enumerate(narratives):
+            terms1 = {t.upper() for t in (n1.get("anchor_terms") or [])}
+            all_terms1 = terms1 | {t.upper() for t in (n1.get("related_terms") or [])}
+            nid1 = n1.get("narrative_id", "")
+            if not terms1:
+                continue
+
+            for j in range(i + 1, len(narratives)):
+                n2 = narratives[j]
+                terms2 = {t.upper() for t in (n2.get("anchor_terms") or [])}
+                all_terms2 = terms2 | {t.upper() for t in (n2.get("related_terms") or [])}
+                nid2 = n2.get("narrative_id", "")
+                if not terms2:
+                    continue
+
+                # Check anchor term overlap
+                overlap = len(terms1 & terms2)
+                min_size = min(len(terms1), len(terms2))
+                if min_size > 0 and overlap / min_size >= self.cfg.cluster_term_overlap_pct:
+                    union(nid1, nid2)
+                    continue
+
+                # Check broader term overlap (anchor + related)
+                broad_overlap = len(all_terms1 & all_terms2)
+                broad_min = min(len(all_terms1), len(all_terms2))
+                if broad_min > 0 and broad_overlap / broad_min >= self.cfg.cluster_term_overlap_pct:
+                    union(nid1, nid2)
+                    continue
+
+                # Check shared entity names
+                entities1 = {
+                    (e.get("name", "").upper(), e.get("type", ""))
+                    for e in (n1.get("entities") or [])
+                    if e.get("name")
+                }
+                entities2 = {
+                    (e.get("name", "").upper(), e.get("type", ""))
+                    for e in (n2.get("entities") or [])
+                    if e.get("name")
+                }
+                if entities1 and entities2 and len(entities1 & entities2) >= 1:
+                    union(nid1, nid2)
+                    continue
+
+        # 2. Token overlap: >= cluster_token_overlap_min shared linked tokens
+        narrative_ids = [n.get("narrative_id", "") for n in narratives]
+        for i, nid1 in enumerate(narrative_ids):
+            tokens1 = set(token_links.get(nid1, []))
+            if len(tokens1) < self.cfg.cluster_token_overlap_min:
+                continue
+            for j in range(i + 1, len(narrative_ids)):
+                nid2 = narrative_ids[j]
+                tokens2 = set(token_links.get(nid2, []))
+                if len(tokens1 & tokens2) >= self.cfg.cluster_token_overlap_min:
+                    union(nid1, nid2)
+
+        # Build result mapping
+        return {nid: find(nid) for nid in parent}
+
     # ------------------------------------------------------------------
     # Competition
     # ------------------------------------------------------------------
@@ -406,10 +613,12 @@ class NarrativeIntelligence:
 
         Groups by cluster_id (or treats each narrative as its own group).
         Returns all narratives annotated with:
-          - competition_status: "winner" | "outcompeted" | "no_contest"
+          - competition_status: "winner" | "outcompeted" | "no_contest" | "below_threshold"
           - competition_rank: int (1 = winner)
+          - suppression_reasons: list[dict] (structured reasons for non-winners)
+          - winner_explanation: dict (for winners only — full strength breakdown)
 
-        Narratives not meeting winner_min_strength get competition_status = "below_threshold".
+        Strict winner-takes-all: only rank 1 in each group is the winner.
         """
         # Group by cluster_id
         groups: dict[str, list[dict]] = {}
@@ -422,6 +631,8 @@ class NarrativeIntelligence:
             # Sort by strength descending
             group.sort(key=lambda x: x.get("narrative_strength", 0.0) or 0.0, reverse=True)
 
+            winner_strength = (group[0].get("narrative_strength", 0.0) or 0.0) if group else 0.0
+
             for rank, n in enumerate(group, start=1):
                 annotated = dict(n)
                 strength = n.get("narrative_strength", 0.0) or 0.0
@@ -429,14 +640,48 @@ class NarrativeIntelligence:
                 if len(group) == 1:
                     if strength >= self.cfg.winner_min_strength:
                         annotated["competition_status"] = "no_contest"
+                        annotated["suppression_reasons"] = []
+                        annotated["winner_explanation"] = self._build_winner_explanation(
+                            n, group, rank,
+                        )
                     else:
                         annotated["competition_status"] = "below_threshold"
+                        annotated["suppression_reasons"] = [{
+                            "code": SUPPRESSION_BELOW_MIN_STRENGTH,
+                            "actual": round(strength, 4),
+                            "threshold": self.cfg.winner_min_strength,
+                            "detail": f"strength {strength:.4f} < winner minimum {self.cfg.winner_min_strength}",
+                        }]
                 elif rank == 1 and strength >= self.cfg.winner_min_strength:
                     annotated["competition_status"] = "winner"
+                    annotated["suppression_reasons"] = []
+                    annotated["winner_explanation"] = self._build_winner_explanation(
+                        n, group, rank,
+                    )
                 elif strength < self.cfg.winner_min_strength:
                     annotated["competition_status"] = "below_threshold"
+                    annotated["suppression_reasons"] = [{
+                        "code": SUPPRESSION_BELOW_MIN_STRENGTH,
+                        "actual": round(strength, 4),
+                        "threshold": self.cfg.winner_min_strength,
+                        "detail": f"strength {strength:.4f} < winner minimum {self.cfg.winner_min_strength}",
+                    }]
                 else:
                     annotated["competition_status"] = "outcompeted"
+                    annotated["suppression_reasons"] = [
+                        {
+                            "code": SUPPRESSION_LOST_TO_STRONGER_NARRATIVE,
+                            "actual": round(strength, 4),
+                            "threshold": round(winner_strength, 4),
+                            "detail": f"lost to narrative with strength {winner_strength:.4f} (delta {winner_strength - strength:.4f})",
+                        },
+                        {
+                            "code": SUPPRESSION_NOT_TOP_IN_CLUSTER,
+                            "actual": rank,
+                            "threshold": 1,
+                            "detail": f"rank {rank} of {len(group)} in cluster",
+                        },
+                    ]
 
                 annotated["competition_rank"] = rank
                 results.append(annotated)
@@ -449,12 +694,16 @@ class NarrativeIntelligence:
     ) -> list[dict]:
         """Select winner tokens within a narrative.
 
+        Strict winner-takes-all: only the #1 token is the winner.
+        All others are suppressed UNLESS they EXCEED the winner by the
+        configured margin (explicit override — this handles the rare case
+        where scoring order differs from net_potential order).
+
         Input: list of scored token dicts with at least net_potential and token_id.
         Returns the same list annotated with:
-          - token_competition_status: "winner" | "within_margin" | "suppressed"
-
-        Sorted by net_potential descending. The top token is the winner.
-        Others within token_competition_margin of the winner are "within_margin".
+          - token_competition_status: "winner" | "suppressed"
+          - suppression_reasons: list[dict]
+          - winner_explanation: dict (for winner only)
         """
         if not scored_tokens:
             return []
@@ -466,20 +715,147 @@ class NarrativeIntelligence:
         )
 
         winner_score = sorted_tokens[0].get("net_potential", 0.0) or 0.0
+        winner_id = sorted_tokens[0].get("token_id", "")
 
         results = []
         for i, t in enumerate(sorted_tokens):
             annotated = dict(t)
             score = t.get("net_potential", 0.0) or 0.0
+
             if i == 0:
                 annotated["token_competition_status"] = "winner"
-            elif winner_score - score <= self.cfg.token_competition_margin:
-                annotated["token_competition_status"] = "within_margin"
+                annotated["suppression_reasons"] = []
+                annotated["winner_explanation"] = {
+                    "net_potential": round(score, 4),
+                    "rank": 1,
+                    "total_competitors": len(sorted_tokens),
+                    "margin_over_second": round(
+                        score - (sorted_tokens[1].get("net_potential", 0.0) or 0.0), 4
+                    ) if len(sorted_tokens) > 1 else None,
+                }
+            elif score > winner_score + self.cfg.token_competition_margin:
+                # Explicit override: this token exceeds the winner by margin
+                # (should not happen given sorting, but guards against edge cases)
+                annotated["token_competition_status"] = "winner"
+                annotated["suppression_reasons"] = []
+                annotated["winner_explanation"] = {
+                    "net_potential": round(score, 4),
+                    "rank": i + 1,
+                    "total_competitors": len(sorted_tokens),
+                    "override_reason": "exceeds_winner_by_margin",
+                }
             else:
                 annotated["token_competition_status"] = "suppressed"
+                suppression = [{
+                    "code": SUPPRESSION_LOST_TO_STRONGER_TOKEN,
+                    "actual": round(score, 4),
+                    "threshold": round(winner_score, 4),
+                    "detail": f"net_potential {score:.4f} < winner {winner_score:.4f} (delta {winner_score - score:.4f})",
+                }]
+                if winner_score - score <= self.cfg.token_competition_margin:
+                    suppression.append({
+                        "code": SUPPRESSION_WINNER_MARGIN_NOT_MET,
+                        "actual": round(winner_score - score, 4),
+                        "threshold": self.cfg.token_competition_margin,
+                        "detail": f"within margin {self.cfg.token_competition_margin} but strict winner-takes-all enforced",
+                    })
+                annotated["suppression_reasons"] = suppression
+
             results.append(annotated)
 
         return results
+
+    # ------------------------------------------------------------------
+    # Winner Explanation (Requirement 5)
+    # ------------------------------------------------------------------
+
+    def _build_winner_explanation(
+        self,
+        narrative: dict,
+        group: list[dict],
+        rank: int,
+    ) -> dict:
+        """Build a full 'why this won' explanation for a narrative winner."""
+        sources = narrative.get("sources") or []
+        source_count = len(sources)
+        strength = narrative.get("narrative_strength", 0.0) or 0.0
+        velocity = narrative.get("narrative_velocity", 0.0) or 0.0
+        velocity_state = narrative.get("velocity_state", "unknown")
+        source_types = {s.get("source_type") for s in sources if s.get("source_type")}
+
+        # Compute sub-score contributions
+        sc_score = min(source_count / self.cfg.max_source_count, 1.0) if self.cfg.max_source_count > 0 else 0.0
+        vel_score = min(max(velocity, 0.0) / self.cfg.max_velocity, 1.0) if self.cfg.max_velocity > 0 else 0.0
+        div_score = min(len(source_types) / self.cfg.max_source_types, 1.0) if self.cfg.max_source_types > 0 else 0.0
+
+        explanation = {
+            "narrative_strength": round(strength, 4),
+            "strength_breakdown": {
+                "source_count_contribution": round(sc_score * self.cfg.strength_w_source_count, 4),
+                "velocity_contribution": round(vel_score * self.cfg.strength_w_velocity, 4),
+                "recency_contribution": round(
+                    strength
+                    - sc_score * self.cfg.strength_w_source_count
+                    - vel_score * self.cfg.strength_w_velocity
+                    - div_score * self.cfg.strength_w_diversity,
+                    4,
+                ),
+                "diversity_contribution": round(div_score * self.cfg.strength_w_diversity, 4),
+            },
+            "velocity": round(velocity, 6),
+            "velocity_state": velocity_state,
+            "source_count": source_count,
+            "source_types": sorted(source_types),
+            "source_diversity": len(source_types),
+            "cluster_size": len(group),
+            "rank": rank,
+        }
+
+        # Runner-up comparison
+        if len(group) > 1 and rank == 1:
+            runner_up = group[1]
+            runner_strength = runner_up.get("narrative_strength", 0.0) or 0.0
+            explanation["runner_up"] = {
+                "narrative_id": runner_up.get("narrative_id"),
+                "strength": round(runner_strength, 4),
+                "strength_difference": round(strength - runner_strength, 4),
+                "margin_of_victory": round(
+                    (strength - runner_strength) / strength if strength > 0 else 0.0, 4
+                ),
+            }
+            explanation["competing_narratives"] = len(group)
+
+        return explanation
+
+    def build_token_winner_explanation(
+        self,
+        winner: dict,
+        all_tokens: list[dict],
+    ) -> dict:
+        """Build a full 'why this won' explanation for a token winner."""
+        score = winner.get("net_potential", 0.0) or 0.0
+        explanation = {
+            "token_id": winner.get("token_id"),
+            "net_potential": round(score, 4),
+            "rank": 1,
+            "total_competitors": len(all_tokens),
+        }
+
+        if len(all_tokens) > 1:
+            sorted_by_score = sorted(
+                all_tokens,
+                key=lambda x: x.get("net_potential", 0.0) or 0.0,
+                reverse=True,
+            )
+            if len(sorted_by_score) > 1:
+                runner_score = sorted_by_score[1].get("net_potential", 0.0) or 0.0
+                explanation["runner_up"] = {
+                    "token_id": sorted_by_score[1].get("token_id"),
+                    "net_potential": round(runner_score, 4),
+                    "score_difference": round(score - runner_score, 4),
+                }
+
+        return explanation
 
 
 # ---------------------------------------------------------------------------
