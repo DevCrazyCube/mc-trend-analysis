@@ -138,6 +138,27 @@ class TokenRepository:
         )
         return _deserialize_row(cursor.fetchone())
 
+    def prune_old_snapshots(self, older_than: str) -> int:
+        """Delete chain snapshots older than *older_than* ISO timestamp.
+
+        Retains the most recent snapshot per token regardless of age.
+        Returns the number of rows deleted.
+        """
+        cursor = self.db.connection.execute(
+            """
+            DELETE FROM chain_snapshots
+            WHERE sampled_at < ?
+              AND snapshot_id NOT IN (
+                  SELECT snapshot_id FROM chain_snapshots cs2
+                  WHERE cs2.token_id = chain_snapshots.token_id
+                  ORDER BY sampled_at DESC LIMIT 1
+              )
+            """,
+            (older_than,),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount
+
 
 # ---------------------------------------------------------------------------
 # NarrativeRepository
@@ -161,19 +182,19 @@ class NarrativeRepository:
         )
         return _deserialize_row(cursor.fetchone())
 
-    def get_active(self, states: list[str] | None = None) -> list[dict]:
+    def get_active(self, states: list[str] | None = None, limit: int = 500) -> list[dict]:
         """Return narratives in the given states (default: EMERGING, PEAKING)."""
         if states is None:
             states = ["EMERGING", "PEAKING"]
         placeholders = ", ".join("?" for _ in states)
         cursor = self.db.connection.execute(
             f"SELECT * FROM narratives WHERE state IN ({placeholders}) "
-            "ORDER BY attention_score DESC",
-            states,
+            "ORDER BY attention_score DESC LIMIT ?",
+            [*states, limit],
         )
         return _deserialize_rows(cursor.fetchall())
 
-    def search_by_terms(self, terms: list[str]) -> list[dict]:
+    def search_by_terms(self, terms: list[str], limit: int = 100) -> list[dict]:
         """Search narratives whose anchor_terms or related_terms contain any of *terms*."""
         conditions = []
         params: list[str] = []
@@ -183,7 +204,8 @@ class NarrativeRepository:
             params.extend([pattern, pattern])
         where_clause = " OR ".join(conditions)
         cursor = self.db.connection.execute(
-            f"SELECT * FROM narratives WHERE {where_clause}", params
+            f"SELECT * FROM narratives WHERE {where_clause} LIMIT ?",
+            [*params, limit],
         )
         return _deserialize_rows(cursor.fetchall())
 
@@ -281,6 +303,27 @@ class ScoringRepository:
         )
         return _deserialize_rows(cursor.fetchall())
 
+    def prune_old_scored_tokens(self, older_than: str) -> int:
+        """Delete scored_tokens records older than *older_than* ISO timestamp.
+
+        Retains the most recent score per link_id regardless of age.
+        Returns the number of rows deleted.
+        """
+        cursor = self.db.connection.execute(
+            """
+            DELETE FROM scored_tokens
+            WHERE scored_at < ?
+              AND score_id NOT IN (
+                  SELECT score_id FROM scored_tokens st2
+                  WHERE st2.link_id = scored_tokens.link_id
+                  ORDER BY scored_at DESC LIMIT 1
+              )
+            """,
+            (older_than,),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount
+
 
 # ---------------------------------------------------------------------------
 # AlertRepository
@@ -321,13 +364,26 @@ class AlertRepository:
         )
         return _deserialize_rows(cursor.fetchall())
 
-    def get_expired(self, now: str) -> list[dict]:
+    def get_expired(self, now: str, limit: int = 100) -> list[dict]:
         """Return active alerts whose expires_at is at or before *now*."""
         cursor = self.db.connection.execute(
-            "SELECT * FROM alerts WHERE expires_at <= ? AND status = 'ACTIVE'",
-            (now,),
+            "SELECT * FROM alerts WHERE expires_at <= ? AND status = 'ACTIVE' LIMIT ?",
+            (now, limit),
         )
         return _deserialize_rows(cursor.fetchall())
+
+    def purge_old_retired(self, older_than: str) -> int:
+        """Delete retired/expired alerts older than *older_than* ISO timestamp.
+
+        Returns the number of rows deleted.
+        """
+        cursor = self.db.connection.execute(
+            "DELETE FROM alerts WHERE status IN ('RETIRED', 'EXPIRED') "
+            "AND updated_at < ?",
+            (older_than,),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount
 
     def retire(self, alert_id: str, reason: str, retired_at: str) -> None:
         """Retire an alert with a reason and timestamp."""
@@ -365,6 +421,20 @@ class SourceGapRepository:
             (ended_at, gap_id),
         )
         self.db.connection.commit()
+
+    def close_open_gaps_for_source(self, source_name: str, ended_at: str) -> int:
+        """Close all open gaps for *source_name*.
+
+        Called when an adapter successfully fetches data after a period of failures.
+        Returns the number of gaps closed.
+        """
+        cursor = self.db.connection.execute(
+            "UPDATE source_gaps SET ended_at = ? "
+            "WHERE source_name = ? AND ended_at IS NULL",
+            (ended_at, source_name),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount
 
     def get_open_gaps(self) -> list[dict]:
         """Return all source gaps that have not yet been closed."""

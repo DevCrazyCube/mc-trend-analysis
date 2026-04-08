@@ -1,15 +1,24 @@
 """Search trends adapter for attention measurement."""
 import httpx
 from datetime import datetime, timezone
-from .base import SourceAdapter, logger
+from .base import SourceAdapter, logger, retry_fetch
+
 
 class SerpAPITrendsAdapter(SourceAdapter):
     """Fetch Google Trends data via SerpAPI."""
 
-    def __init__(self, api_key: str | None = None, timeout: float = 10.0):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        timeout: float = 10.0,
+        geo: str = "US",
+        signal_strength: float = 0.7,
+    ):
         super().__init__(source_name="serpapi_trends", source_type="search_trends")
         self.api_key = api_key
         self.timeout = timeout
+        self.geo = geo
+        self.signal_strength = signal_strength
         self.base_url = "https://serpapi.com/search"
         self._client: httpx.AsyncClient | None = None
 
@@ -26,14 +35,21 @@ class SerpAPITrendsAdapter(SourceAdapter):
 
         try:
             client = await self._get_client()
-            response = await client.get(
-                self.base_url,
-                params={"engine": "google_trends_trending_now", "frequency": "realtime",
-                        "geo": "US", "api_key": self.api_key}
-            )
-            response.raise_for_status()
-            data = response.json()
 
+            async def _do_fetch():
+                r = await client.get(
+                    self.base_url,
+                    params={
+                        "engine": "google_trends_trending_now",
+                        "frequency": "realtime",
+                        "geo": self.geo,
+                        "api_key": self.api_key,
+                    },
+                )
+                r.raise_for_status()
+                return r.json()
+
+            data = await retry_fetch(_do_fetch, self.source_name)
             self._mark_healthy()
 
             trends = []
@@ -55,7 +71,6 @@ class SerpAPITrendsAdapter(SourceAdapter):
         try:
             query = raw.get("query") or raw.get("title", {}).get("query", "")
             if not query:
-                # Try to get from nested structure
                 queries = raw.get("trend_keywords", [])
                 if queries:
                     query = queries[0] if isinstance(queries[0], str) else str(queries[0])
@@ -71,7 +86,7 @@ class SerpAPITrendsAdapter(SourceAdapter):
                 "description": f"Trending search: {query}",
                 "source_type": "search_trends",
                 "source_name": "google_trends",
-                "signal_strength": 0.7,
+                "signal_strength": self.signal_strength,
                 "published_at": datetime.now(timezone.utc).isoformat(),
             }
         except Exception as e:

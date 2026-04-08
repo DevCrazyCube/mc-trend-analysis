@@ -1,10 +1,42 @@
 """Base class for all source adapters."""
+import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+# Default retry delays for transient network failures (seconds)
+DEFAULT_RETRY_DELAYS = (1.0, 2.0, 4.0)
+
+
+async def retry_fetch(coro_func, source_name: str,
+                      delays: tuple = DEFAULT_RETRY_DELAYS):
+    """Retry an async callable up to len(delays)+1 times with exponential backoff.
+
+    *coro_func* must be a zero-argument async callable that either returns a
+    non-empty list on success or raises an exception on failure.
+
+    Returns the first successful result, or raises the last exception after all
+    attempts are exhausted.
+    """
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate((*delays, None), start=1):
+        try:
+            result = await coro_func()
+            if attempt > 1:
+                logger.info("fetch_succeeded_after_retry",
+                            source=source_name, attempt=attempt)
+            return result
+        except Exception as e:
+            last_exc = e
+            logger.warning("fetch_attempt_failed",
+                           source=source_name, attempt=attempt, error=str(e))
+            if delay is not None:
+                await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
 
 class SourceAdapter(ABC):
     """Base interface for all ingestion source adapters."""
@@ -29,7 +61,11 @@ class SourceAdapter(ABC):
             "source_name": self.source_name,
             "source_type": self.source_type,
             "healthy": self._healthy,
-            "last_successful_fetch": self._last_successful_fetch.isoformat() if self._last_successful_fetch else None,
+            "last_successful_fetch": (
+                self._last_successful_fetch.isoformat()
+                if self._last_successful_fetch
+                else None
+            ),
             "consecutive_failures": self._consecutive_failures,
         }
 
@@ -41,5 +77,9 @@ class SourceAdapter(ABC):
     def _mark_unhealthy(self, error: str):
         self._healthy = False
         self._consecutive_failures += 1
-        logger.warning("source_unhealthy", source=self.source_name, error=error,
-                       consecutive_failures=self._consecutive_failures)
+        logger.warning(
+            "source_unhealthy",
+            source=self.source_name,
+            error=error,
+            consecutive_failures=self._consecutive_failures,
+        )

@@ -49,6 +49,7 @@ class AlertEngine:
         alert_repo,
         thresholds: AlertThresholds | None = None,
         expiry_minutes: dict[str, int] | None = None,
+        history_max_entries: int = 50,
     ):
         """
         Parameters
@@ -61,12 +62,15 @@ class AlertEngine:
         expiry_minutes:
             Optional per-type expiry overrides; uses DEFAULT_EXPIRY_MINUTES
             when None.
+        history_max_entries:
+            Maximum number of lifecycle history entries to retain per alert.
         """
         self.alert_repo = alert_repo
         self.thresholds = thresholds if thresholds is not None else AlertThresholds()
         self.expiry_minutes = (
             expiry_minutes if expiry_minutes is not None else dict(DEFAULT_EXPIRY_MINUTES)
         )
+        self.history_max_entries = history_max_entries
 
     # ------------------------------------------------------------------
     # Public API
@@ -313,9 +317,11 @@ class AlertEngine:
             ),
         }
 
-        # Copy existing alert and update fields
+        # Copy existing alert and update fields; cap history to avoid unbounded growth
         history = list(existing_alert.get("history", []))
         history.append(history_entry)
+        if len(history) > self.history_max_entries:
+            history = history[-self.history_max_entries:]
 
         # Compute new expiry from now
         expiry_min = self.expiry_minutes.get(new_type, 120)

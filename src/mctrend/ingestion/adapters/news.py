@@ -1,16 +1,29 @@
 """News source adapter for narrative detection."""
 import httpx
 from datetime import datetime, timezone
-from .base import SourceAdapter, logger
+from .base import SourceAdapter, logger, retry_fetch
+
+_DEFAULT_QUERY_TERMS = ["crypto", "meme", "viral", "trending"]
+
 
 class NewsAPIAdapter(SourceAdapter):
     """Fetch trending news from NewsAPI.org for narrative detection."""
 
-    def __init__(self, api_key: str | None = None, timeout: float = 10.0):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        timeout: float = 10.0,
+        query_terms: list[str] | None = None,
+        page_size: int = 10,
+        signal_strength: float = 0.6,
+    ):
         super().__init__(source_name="newsapi", source_type="news")
         self.api_key = api_key
         self.timeout = timeout
         self.base_url = "https://newsapi.org/v2"
+        self.query_terms = query_terms or _DEFAULT_QUERY_TERMS
+        self.page_size = page_size
+        self.signal_strength = signal_strength
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self):
@@ -28,20 +41,23 @@ class NewsAPIAdapter(SourceAdapter):
             client = await self._get_client()
             all_articles = []
 
-            # Fetch top headlines
-            for query in ["crypto", "meme", "viral", "trending"]:
-                response = await client.get(
-                    f"{self.base_url}/everything",
-                    params={"q": query, "sortBy": "publishedAt", "pageSize": 10,
-                            "language": "en", "apiKey": self.api_key}
-                )
-                if response.status_code == 200:
-                    articles = response.json().get("articles", [])
-                    all_articles.extend(articles)
+            for query in self.query_terms:
+                async def _do_fetch(q=query):
+                    r = await client.get(
+                        f"{self.base_url}/everything",
+                        params={"q": q, "sortBy": "publishedAt",
+                                "pageSize": self.page_size, "language": "en",
+                                "apiKey": self.api_key},
+                    )
+                    r.raise_for_status()
+                    return r.json().get("articles", [])
+
+                articles = await retry_fetch(_do_fetch, self.source_name)
+                all_articles.extend(articles)
 
             self._mark_healthy()
 
-            # Normalize
+            # Normalize and deduplicate by title
             events = []
             seen_titles = set()
             for article in all_articles:
@@ -68,7 +84,6 @@ class NewsAPIAdapter(SourceAdapter):
             title = article.get("title", "")
             description = article.get("description", "") or ""
 
-            # Simple keyword extraction from title
             terms = self._extract_terms(title)
             if not terms:
                 return None
@@ -87,7 +102,7 @@ class NewsAPIAdapter(SourceAdapter):
                 "description": title,
                 "source_type": "news",
                 "source_name": source_name,
-                "signal_strength": 0.6,
+                "signal_strength": self.signal_strength,
                 "published_at": published.isoformat(),
                 "url": article.get("url"),
                 "raw_text": f"{title} {description}",
@@ -97,21 +112,22 @@ class NewsAPIAdapter(SourceAdapter):
             return None
 
     def _extract_terms(self, text: str) -> list[str]:
-        """Extract significant terms from text. Simple keyword extraction."""
-        # Remove common stop words and extract capitalized/significant terms
-        stop_words = {"the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-                      "have", "has", "had", "do", "does", "did", "will", "would", "could",
-                      "should", "may", "might", "can", "shall", "to", "of", "in", "for",
-                      "on", "with", "at", "by", "from", "as", "into", "through", "during",
-                      "before", "after", "above", "below", "between", "under", "again",
-                      "further", "then", "once", "here", "there", "when", "where", "why",
-                      "how", "all", "each", "every", "both", "few", "more", "most", "other",
-                      "some", "such", "no", "nor", "not", "only", "own", "same", "so",
-                      "than", "too", "very", "just", "about", "up", "out", "new", "also",
-                      "and", "but", "or", "if", "this", "that", "it", "its", "what", "which",
-                      "who", "whom", "these", "those", "i", "me", "my", "we", "our", "you",
-                      "your", "he", "she", "they", "them", "his", "her", "their", "says",
-                      "said", "over", "still", "first", "last", "get", "got", "make"}
+        """Extract significant terms from text."""
+        stop_words = {
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+            "on", "with", "at", "by", "from", "as", "into", "through", "during",
+            "before", "after", "above", "below", "between", "under", "again",
+            "further", "then", "once", "here", "there", "when", "where", "why",
+            "how", "all", "each", "every", "both", "few", "more", "most", "other",
+            "some", "such", "no", "nor", "not", "only", "own", "same", "so",
+            "than", "too", "very", "just", "about", "up", "out", "new", "also",
+            "and", "but", "or", "if", "this", "that", "it", "its", "what", "which",
+            "who", "whom", "these", "those", "i", "me", "my", "we", "our", "you",
+            "your", "he", "she", "they", "them", "his", "her", "their", "says",
+            "said", "over", "still", "first", "last", "get", "got", "make",
+        }
 
         words = text.replace("-", " ").replace("'", "").split()
         terms = []
@@ -120,7 +136,6 @@ class NewsAPIAdapter(SourceAdapter):
             if len(clean) >= 2 and clean.lower() not in stop_words:
                 terms.append(clean.upper())
 
-        # Deduplicate while preserving order
         seen = set()
         unique = []
         for t in terms:

@@ -295,6 +295,12 @@ class Settings(BaseModel):
     this class.  See docs/rules/engineering-rules.md Rule 2.
     """
 
+    # -- Environment ----------------------------------------------------------
+    environment: str = Field(
+        "demo",
+        description="Deployment environment: 'demo', 'dev', or 'prod'",
+    )
+
     # -- Data source URLs / keys ---------------------------------------------
     solana_rpc_url: str = Field(
         "https://api.mainnet-beta.solana.com",
@@ -311,6 +317,11 @@ class Settings(BaseModel):
     # -- Delivery channels ----------------------------------------------------
     telegram_bot_token: str = Field("", description="Telegram Bot API token")
     telegram_chat_id: str = Field("", description="Telegram chat ID for alert delivery")
+    webhook_url: str = Field("", description="Webhook URL for alert delivery")
+    webhook_secret: str = Field(
+        "",
+        description="HMAC secret for webhook request signing (X-Signature-256 header)",
+    )
 
     # -- Storage --------------------------------------------------------------
     database_path: str = Field(
@@ -344,6 +355,25 @@ class Settings(BaseModel):
         description="Minimum confidence_score to emit any alert",
     )
 
+    # -- Ingestion adapter parameters -----------------------------------------
+    news_query_terms: list[str] = Field(
+        default_factory=lambda: ["crypto", "meme", "viral", "trending"],
+        description="Search query terms for NewsAPI adapter",
+    )
+    news_page_size: int = Field(
+        10, gt=0, description="Articles per query for NewsAPI adapter"
+    )
+    news_signal_strength: float = Field(
+        0.6, ge=0.0, le=1.0, description="Default signal strength for news events"
+    )
+    trends_geo: str = Field("US", description="Geographic filter for Google Trends adapter")
+    trends_signal_strength: float = Field(
+        0.7, ge=0.0, le=1.0, description="Default signal strength for trend events"
+    )
+    pumpfun_fetch_limit: int = Field(
+        50, gt=0, description="Number of tokens to fetch per Pump.fun API call"
+    )
+
     # -- External call defaults -----------------------------------------------
     external_api_timeout_seconds: float = Field(
         10.0, gt=0, description="Default timeout for external API calls"
@@ -353,6 +383,20 @@ class Settings(BaseModel):
     )
     max_expected_sources: int = Field(
         5, gt=0, description="Normalizer for source_count_score in confidence calculation"
+    )
+
+    # -- Retention / pruning --------------------------------------------------
+    chain_snapshot_retention_hours: int = Field(
+        48, gt=0, description="Hours before old chain snapshots are pruned"
+    )
+    scored_token_retention_hours: int = Field(
+        72, gt=0, description="Hours before old scored_token records are pruned"
+    )
+    retired_alert_retention_hours: int = Field(
+        168, gt=0, description="Hours before retired/expired alerts are purged (7 days)"
+    )
+    alert_history_max_entries: int = Field(
+        50, gt=0, description="Max lifecycle history entries retained per alert"
     )
 
     # -- Scoring weights ------------------------------------------------------
@@ -399,6 +443,7 @@ class Settings(BaseModel):
         env = os.environ
 
         return cls(
+            environment=env.get("ENVIRONMENT", cls.model_fields["environment"].default),
             solana_rpc_url=env.get(
                 "SOLANA_RPC_URL", cls.model_fields["solana_rpc_url"].default
             ),
@@ -415,6 +460,10 @@ class Settings(BaseModel):
             ),
             telegram_chat_id=env.get(
                 "TELEGRAM_CHAT_ID", cls.model_fields["telegram_chat_id"].default
+            ),
+            webhook_url=env.get("WEBHOOK_URL", cls.model_fields["webhook_url"].default),
+            webhook_secret=env.get(
+                "WEBHOOK_SECRET", cls.model_fields["webhook_secret"].default
             ),
             database_path=env.get(
                 "DATABASE_PATH", cls.model_fields["database_path"].default
@@ -449,6 +498,52 @@ class Settings(BaseModel):
                 env.get(
                     "CONFIDENCE_FLOOR_FOR_ALERT",
                     cls.model_fields["confidence_floor_for_alert"].default,
+                )
+            ),
+            news_signal_strength=float(
+                env.get(
+                    "NEWS_SIGNAL_STRENGTH",
+                    cls.model_fields["news_signal_strength"].default,
+                )
+            ),
+            trends_signal_strength=float(
+                env.get(
+                    "TRENDS_SIGNAL_STRENGTH",
+                    cls.model_fields["trends_signal_strength"].default,
+                )
+            ),
+            trends_geo=env.get("TRENDS_GEO", cls.model_fields["trends_geo"].default),
+            pumpfun_fetch_limit=int(
+                env.get(
+                    "PUMPFUN_FETCH_LIMIT",
+                    cls.model_fields["pumpfun_fetch_limit"].default,
+                )
+            ),
+            news_page_size=int(
+                env.get("NEWS_PAGE_SIZE", cls.model_fields["news_page_size"].default)
+            ),
+            chain_snapshot_retention_hours=int(
+                env.get(
+                    "CHAIN_SNAPSHOT_RETENTION_HOURS",
+                    cls.model_fields["chain_snapshot_retention_hours"].default,
+                )
+            ),
+            scored_token_retention_hours=int(
+                env.get(
+                    "SCORED_TOKEN_RETENTION_HOURS",
+                    cls.model_fields["scored_token_retention_hours"].default,
+                )
+            ),
+            retired_alert_retention_hours=int(
+                env.get(
+                    "RETIRED_ALERT_RETENTION_HOURS",
+                    cls.model_fields["retired_alert_retention_hours"].default,
+                )
+            ),
+            alert_history_max_entries=int(
+                env.get(
+                    "ALERT_HISTORY_MAX_ENTRIES",
+                    cls.model_fields["alert_history_max_entries"].default,
                 )
             ),
         )

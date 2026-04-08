@@ -73,12 +73,17 @@ class IngestionManager:
         self._source_gaps.append(gap)
         logger.warning("source_gap_opened", **gap)
 
-    def get_source_health(self) -> list[dict]:
-        """Get health status of all registered adapters."""
-        health = []
+    def get_source_health(self) -> dict[str, dict]:
+        """Get health status of all registered adapters, keyed by source_name."""
+        health: dict[str, dict] = {}
         for adapter in self._token_adapters + self._event_adapters:
-            health.append(adapter.get_source_meta())
+            meta = adapter.get_source_meta()
+            health[adapter.source_name] = meta
         return health
+
+    def get_source_health_list(self) -> list[dict]:
+        """Get health status of all registered adapters as a list."""
+        return list(self.get_source_health().values())
 
     def get_pending_gaps(self) -> list[dict]:
         return [g for g in self._source_gaps if g.get("ended_at") is None]

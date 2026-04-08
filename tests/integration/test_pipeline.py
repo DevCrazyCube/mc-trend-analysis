@@ -118,7 +118,7 @@ class TestPipelineIntegration:
         assert stats["cycles_completed"] == 1
         assert stats["total_tokens_processed"] >= 2
         assert stats["total_alerts_generated"] >= 1
-        assert isinstance(stats["source_health"], list)
+        assert isinstance(stats["source_health"], dict)
 
         await pipeline.ingestion.close_all()
         await pipeline.delivery.close_all()

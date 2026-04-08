@@ -1,5 +1,8 @@
 """Delivery channel implementations."""
 
+import asyncio
+import hashlib
+import hmac
 import json
 import uuid
 from abc import ABC, abstractmethod
@@ -13,6 +16,9 @@ import structlog
 from .formatter import format_alert_telegram, format_alert_text, format_alert_json
 
 logger = structlog.get_logger(__name__)
+
+# Retry settings for transient delivery failures
+_RETRY_DELAYS = (1.0, 2.0, 4.0)  # seconds between attempts
 
 
 class DeliveryChannel(ABC):
@@ -62,7 +68,7 @@ class ConsoleChannel(DeliveryChannel):
 
 
 class TelegramChannel(DeliveryChannel):
-    """Deliver alerts via Telegram Bot API."""
+    """Deliver alerts via Telegram Bot API with exponential backoff retry."""
 
     def __init__(self, bot_token: str, chat_id: str, timeout: float = 10.0):
         super().__init__(channel_type="telegram", channel_id=chat_id)
@@ -78,30 +84,44 @@ class TelegramChannel(DeliveryChannel):
 
     async def deliver(self, alert: dict) -> dict:
         alert_id = alert.get("alert_id", "unknown")
-        try:
-            client = await self._get_client()
-            text = format_alert_telegram(alert)
+        last_error: str = ""
 
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            response = await client.post(url, json={
-                "chat_id": self.chat_id,
-                "text": text,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            })
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
+            try:
+                client = await self._get_client()
+                text = format_alert_telegram(alert)
 
-            if response.status_code == 200:
-                logger.info("alert_delivered", channel="telegram",
-                            alert_id=alert_id, chat_id=self.chat_id)
-                return self._make_delivery_log(alert_id, "delivered")
-            else:
-                reason = f"HTTP {response.status_code}: {response.text[:200]}"
-                logger.error("telegram_delivery_failed", reason=reason)
-                return self._make_delivery_log(alert_id, "failed", reason)
+                url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+                response = await client.post(url, json={
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                })
 
-        except Exception as e:
-            logger.error("telegram_delivery_error", error=str(e))
-            return self._make_delivery_log(alert_id, "failed", str(e))
+                if response.status_code == 200:
+                    logger.info("alert_delivered", channel="telegram",
+                                alert_id=alert_id, chat_id=self.chat_id,
+                                attempt=attempt)
+                    return self._make_delivery_log(alert_id, "delivered")
+
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                logger.warning("telegram_delivery_attempt_failed",
+                               attempt=attempt, reason=last_error,
+                               alert_id=alert_id)
+
+            except Exception as e:
+                last_error = str(e)
+                logger.warning("telegram_delivery_attempt_error",
+                               attempt=attempt, error=last_error,
+                               alert_id=alert_id)
+
+            if delay is not None:
+                await asyncio.sleep(delay)
+
+        logger.error("telegram_delivery_failed_all_attempts",
+                     alert_id=alert_id, last_error=last_error)
+        return self._make_delivery_log(alert_id, "failed", last_error)
 
     async def close(self):
         if self._client and not self._client.is_closed:
@@ -109,14 +129,30 @@ class TelegramChannel(DeliveryChannel):
 
 
 class WebhookChannel(DeliveryChannel):
-    """Deliver alerts via HTTP webhook POST."""
+    """Deliver alerts via HTTP webhook POST.
 
-    def __init__(self, url: str, headers: dict | None = None, timeout: float = 10.0):
+    When a ``secret`` is provided, each request is signed with HMAC-SHA256
+    and the signature is included in the ``X-Signature-256`` header. Receivers
+    can verify authenticity by computing HMAC-SHA256(secret, body) and
+    comparing it to the header value.
+    """
+
+    def __init__(self, url: str, secret: str = "",
+                 extra_headers: dict | None = None, timeout: float = 10.0):
         super().__init__(channel_type="webhook", channel_id=url)
         self.url = url
-        self.headers = headers or {"Content-Type": "application/json"}
+        self.secret = secret
+        self.extra_headers = extra_headers or {}
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+
+    def _sign_payload(self, body: bytes) -> str:
+        """Return HMAC-SHA256 hex digest of *body* using the configured secret."""
+        return hmac.new(
+            self.secret.encode("utf-8"),
+            body,
+            hashlib.sha256,
+        ).hexdigest()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -125,22 +161,50 @@ class WebhookChannel(DeliveryChannel):
 
     async def deliver(self, alert: dict) -> dict:
         alert_id = alert.get("alert_id", "unknown")
-        try:
-            client = await self._get_client()
-            payload = format_alert_json(alert)
+        last_error: str = ""
 
-            response = await client.post(self.url, json=payload, headers=self.headers)
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
+            try:
+                client = await self._get_client()
+                payload = format_alert_json(alert)
+                body = json.dumps(payload).encode("utf-8")
 
-            if 200 <= response.status_code < 300:
-                logger.info("alert_delivered", channel="webhook", alert_id=alert_id)
-                return self._make_delivery_log(alert_id, "delivered")
-            else:
-                reason = f"HTTP {response.status_code}"
-                return self._make_delivery_log(alert_id, "failed", reason)
+                headers = {"Content-Type": "application/json", **self.extra_headers}
+                if self.secret:
+                    headers["X-Signature-256"] = f"sha256={self._sign_payload(body)}"
 
-        except Exception as e:
-            logger.error("webhook_delivery_error", error=str(e))
-            return self._make_delivery_log(alert_id, "failed", str(e))
+                response = await client.post(
+                    self.url,
+                    content=body,
+                    headers=headers,
+                )
+
+                if 200 <= response.status_code < 300:
+                    logger.info("alert_delivered", channel="webhook",
+                                alert_id=alert_id, attempt=attempt)
+                    return self._make_delivery_log(alert_id, "delivered")
+
+                last_error = f"HTTP {response.status_code}"
+                # 4xx errors are not retried — they indicate a client-side problem
+                if 400 <= response.status_code < 500:
+                    logger.error("webhook_delivery_client_error",
+                                 alert_id=alert_id, status=response.status_code)
+                    return self._make_delivery_log(alert_id, "failed", last_error)
+
+                logger.warning("webhook_delivery_attempt_failed",
+                               attempt=attempt, reason=last_error, alert_id=alert_id)
+
+            except Exception as e:
+                last_error = str(e)
+                logger.warning("webhook_delivery_attempt_error",
+                               attempt=attempt, error=last_error, alert_id=alert_id)
+
+            if delay is not None:
+                await asyncio.sleep(delay)
+
+        logger.error("webhook_delivery_failed_all_attempts",
+                     alert_id=alert_id, last_error=last_error)
+        return self._make_delivery_log(alert_id, "failed", last_error)
 
     async def close(self):
         if self._client and not self._client.is_closed:
@@ -148,7 +212,11 @@ class WebhookChannel(DeliveryChannel):
 
 
 class DeliveryRouter:
-    """Routes alerts to configured channels with rate limiting and deduplication."""
+    """Routes alerts to configured channels with rate limiting and deduplication.
+
+    Delivery records are returned from ``deliver_alert()`` and must be persisted
+    by the caller (pipeline or alert engine) to survive restarts.
+    """
 
     # Alert types that get immediate push delivery
     PUSH_TYPES = {"possible_entry", "high_potential_watch", "take_profit_watch", "exit_risk"}
@@ -158,17 +226,31 @@ class DeliveryRouter:
     def __init__(self, rate_limit_per_10min: int = 6):
         self._channels: list[DeliveryChannel] = []
         self._rate_limit = rate_limit_per_10min
-        self._recent_deliveries: deque = deque(maxlen=100)
-        self._delivered_alert_states: set = set()  # (alert_id, alert_type) tuples
+        self._recent_deliveries: deque = deque(maxlen=200)
+        # (alert_id, alert_type) tuples — persisted caller-side; in-memory dedup
+        # covers within-session duplicates. Cross-restart dedup is handled by
+        # the alert engine checking alert_deliveries table before routing.
+        self._delivered_alert_states: set = set()
 
     def add_channel(self, channel: DeliveryChannel):
         self._channels.append(channel)
-        logger.info("delivery_channel_added", type=channel.channel_type, id=channel.channel_id)
+        logger.info("delivery_channel_added",
+                    type=channel.channel_type, id=channel.channel_id)
+
+    def seed_delivered_states(self, delivered_states: set[tuple[str, str]]) -> None:
+        """Pre-populate delivered state from persisted delivery records.
+
+        Call this at startup with (alert_id, alert_type) tuples loaded from
+        the alert_deliveries table to prevent re-delivery after restart.
+        """
+        self._delivered_alert_states.update(delivered_states)
+        logger.info("delivery_dedup_seeded", count=len(delivered_states))
 
     async def deliver_alert(self, alert: dict) -> list[dict]:
-        """
-        Route an alert to appropriate channels. Returns delivery logs.
-        Applies rate limiting and deduplication.
+        """Route an alert to appropriate channels. Returns delivery logs.
+
+        Logs must be persisted by the caller. Rate-limited alerts are logged
+        with status='rate_limited' rather than silently dropped.
         """
         alert_id = alert.get("alert_id", "")
         alert_type = alert.get("alert_type", "")
@@ -187,19 +269,24 @@ class DeliveryRouter:
         # Rate limiting (except for exit_risk)
         if alert_type not in self.BYPASS_RATE_LIMIT_TYPES:
             now = datetime.now(timezone.utc)
-            # Count recent deliveries in last 10 minutes
             recent_count = sum(
                 1 for t in self._recent_deliveries
                 if (now - t).total_seconds() < 600
             )
             if recent_count >= self._rate_limit:
                 logger.warning("delivery_rate_limited", alert_id=alert_id,
-                               recent_count=recent_count)
-                return [{"alert_id": alert_id, "status": "rate_limited",
-                         "channel_type": "all", "channel_id": "all",
-                         "attempted_at": now.isoformat(),
-                         "delivery_id": str(uuid.uuid4()),
-                         "failure_reason": "rate_limit_exceeded"}]
+                               recent_count=recent_count, limit=self._rate_limit)
+                # Return a rate_limited log record instead of silently dropping.
+                # The pipeline persists this so the operator can see dropped alerts.
+                return [{
+                    "delivery_id": str(uuid.uuid4()),
+                    "alert_id": alert_id,
+                    "channel_type": "all",
+                    "channel_id": "all",
+                    "attempted_at": now.isoformat(),
+                    "status": "rate_limited",
+                    "failure_reason": "rate_limit_exceeded",
+                }]
 
         # Deliver to all channels
         logs = []
@@ -207,7 +294,7 @@ class DeliveryRouter:
             log = await channel.deliver(alert)
             logs.append(log)
 
-        # Track delivery
+        # Track delivery in-memory
         self._delivered_alert_states.add(state_key)
         self._recent_deliveries.append(datetime.now(timezone.utc))
 

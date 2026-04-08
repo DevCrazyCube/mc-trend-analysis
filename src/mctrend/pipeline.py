@@ -11,10 +11,13 @@ Flow:
   4. Score each linked token across 6 dimensions
   5. Classify and manage alerts
   6. Deliver alerts to configured channels
+  7. Expire stale alerts
+  8. Prune old data per retention policy
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -24,7 +27,6 @@ from mctrend.delivery.channels import DeliveryRouter
 from mctrend.ingestion.manager import IngestionManager
 from mctrend.normalization.normalizer import (
     merge_narratives,
-    normalize_chain_snapshot,
     normalize_event,
     normalize_token,
 )
@@ -38,6 +40,9 @@ from mctrend.persistence.repositories import (
     TokenRepository,
 )
 from mctrend.scoring.aggregator import ScoringAggregator
+
+if TYPE_CHECKING:
+    from mctrend.config.settings import Settings
 
 logger = structlog.get_logger(__name__)
 
@@ -53,6 +58,7 @@ class Pipeline:
         scorer: ScoringAggregator,
         alert_engine: AlertEngine,
         delivery: DeliveryRouter,
+        settings: "Settings | None" = None,
     ):
         self.db = db
         self.ingestion = ingestion
@@ -60,6 +66,7 @@ class Pipeline:
         self.scorer = scorer
         self.alert_engine = alert_engine
         self.delivery = delivery
+        self.settings = settings
 
         # Repositories
         self.token_repo = TokenRepository(db)
@@ -75,8 +82,7 @@ class Pipeline:
         self._total_alerts_generated = 0
 
     async def run_cycle(self) -> dict:
-        """
-        Execute one full processing cycle.
+        """Execute one full processing cycle.
 
         Returns a summary dict with counts and status.
         """
@@ -93,121 +99,156 @@ class Pipeline:
             "tokens_scored": 0,
             "alerts_created": 0,
             "alerts_delivered": 0,
+            "alerts_expired": 0,
+            "rows_pruned": 0,
             "errors": [],
         }
 
+        # Step 1: Ingest
         try:
-            # --- Step 1: Ingest ---
             raw_tokens = await self.ingestion.fetch_tokens()
             raw_events = await self.ingestion.fetch_events()
 
-            # Record source gaps
+            # Record source gaps; close any that recovered
             for gap in self.ingestion.get_pending_gaps():
                 self.gap_repo.open_gap(gap)
 
-            # --- Step 2: Normalize and store tokens ---
-            new_tokens = []
-            for raw in raw_tokens:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for source_name, meta in self.ingestion.get_source_health().items():
+                if meta.get("healthy"):
+                    closed = self.gap_repo.close_open_gaps_for_source(source_name, now_iso)
+                    if closed:
+                        logger.info("source_gap_closed",
+                                    source=source_name, gaps_closed=closed)
+        except Exception as e:
+            logger.error("pipeline_ingest_error", error=str(e))
+            summary["errors"].append(f"ingest: {e}")
+            raw_tokens, raw_events = [], []
+
+        # Step 2: Normalize and store tokens
+        new_tokens = []
+        for raw in raw_tokens:
+            try:
                 normalized = normalize_token(raw)
                 if normalized is None:
                     continue
-
-                # Check for duplicate by address
                 existing = self.token_repo.get_by_address(normalized["address"])
                 if existing:
-                    continue  # Already known
-
+                    continue
                 self.token_repo.save(normalized)
                 new_tokens.append(normalized)
+            except Exception as e:
+                logger.error("token_normalization_error",
+                             error=str(e), raw=str(raw)[:200])
+                summary["errors"].append(f"normalize_token: {e}")
 
-            summary["tokens_ingested"] = len(new_tokens)
+        summary["tokens_ingested"] = len(new_tokens)
 
-            # --- Step 3: Normalize and store events/narratives ---
-            new_events = []
-            for raw in raw_events:
+        # Step 3: Normalize and store events/narratives
+        new_events = []
+        for raw in raw_events:
+            try:
                 normalized = normalize_event(raw)
                 if normalized is None:
                     continue
-
-                # Check for existing narrative with overlapping terms
                 existing = self._find_matching_narrative(normalized["anchor_terms"])
                 if existing:
-                    # Merge into existing narrative
                     merged = merge_narratives(existing, raw)
                     self.narrative_repo.save(merged)
                 else:
                     self.narrative_repo.save(normalized)
                     new_events.append(normalized)
+            except Exception as e:
+                logger.error("event_normalization_error", error=str(e))
+                summary["errors"].append(f"normalize_event: {e}")
 
-            summary["events_ingested"] = len(new_events)
+        summary["events_ingested"] = len(new_events)
 
-            # --- Step 4: Correlate tokens with narratives ---
+        # Step 4: Correlate tokens with narratives
+        try:
             active_narratives = self.narrative_repo.get_active(
                 states=["EMERGING", "PEAKING"]
             )
-            # Get recently ingested tokens (status = "new")
             tokens_to_correlate = self.token_repo.list_by_status("new", limit=200)
 
             links_created = 0
             for token in tokens_to_correlate:
-                links = self.correlator.correlate_token(token, active_narratives)
-                for link in links:
-                    # Check if link already exists
-                    existing_links = self.link_repo.get_for_token(token["token_id"])
-                    already_linked = any(
-                        el.get("narrative_id") == link["narrative_id"]
-                        for el in existing_links
-                    )
-                    if not already_linked:
-                        self.link_repo.save(link)
-                        links_created += 1
+                try:
+                    links = self.correlator.correlate_token(token, active_narratives)
+                    for link in links:
+                        existing_links = self.link_repo.get_for_token(token["token_id"])
+                        already_linked = any(
+                            el.get("narrative_id") == link["narrative_id"]
+                            for el in existing_links
+                        )
+                        if not already_linked:
+                            self.link_repo.save(link)
+                            links_created += 1
 
-                # Update token status if linked
-                token_links = self.link_repo.get_for_token(token["token_id"])
-                if token_links:
-                    self.token_repo.update_status(
-                        token["token_id"], "linked", "narrative_correlated"
-                    )
+                    token_links = self.link_repo.get_for_token(token["token_id"])
+                    if token_links:
+                        self.token_repo.update_status(
+                            token["token_id"], "linked", "narrative_correlated"
+                        )
+                except Exception as e:
+                    logger.error("token_correlation_error",
+                                 token_id=token.get("token_id"), error=str(e))
+                    summary["errors"].append(f"correlate:{token.get('token_id')}: {e}")
 
-            # OG resolution for namespaces with multiple tokens
+            # OG resolution
             for narrative in active_narratives:
-                nid = narrative.get("narrative_id", narrative.get("id", ""))
-                namespace_links = self.link_repo.get_active_for_narrative(nid)
-                if len(namespace_links) > 1:
-                    # Build candidate info and resolve
-                    token_launch_times = {}
-                    for link in namespace_links:
-                        tok = self.token_repo.get_by_id(link["token_id"])
-                        if tok:
-                            token_launch_times[link["token_id"]] = tok.get("launch_time", "")
-
-                    resolved = self.correlator.resolve_namespace(
-                        namespace_links, token_launch_times
-                    )
-                    for updated_link in resolved:
-                        self.link_repo.save(updated_link)
+                try:
+                    nid = narrative.get("narrative_id", narrative.get("id", ""))
+                    namespace_links = self.link_repo.get_active_for_narrative(nid)
+                    if len(namespace_links) > 1:
+                        token_launch_times: dict[str, datetime] = {}
+                        for link in namespace_links:
+                            tok = self.token_repo.get_by_id(link["token_id"])
+                            if tok and tok.get("launch_time"):
+                                try:
+                                    lt = datetime.fromisoformat(
+                                        tok["launch_time"].replace("Z", "+00:00")
+                                    )
+                                    if lt.tzinfo is None:
+                                        lt = lt.replace(tzinfo=timezone.utc)
+                                    token_launch_times[link["token_id"]] = lt
+                                except (ValueError, TypeError):
+                                    pass
+                        resolved = self.correlator.resolve_namespace(
+                            namespace_links, token_launch_times
+                        )
+                        for updated_link in resolved:
+                            self.link_repo.save(updated_link)
+                except Exception as e:
+                    logger.error("og_resolution_error",
+                                 narrative_id=narrative.get("narrative_id"),
+                                 error=str(e))
+                    summary["errors"].append(f"og_resolve: {e}")
 
             summary["links_created"] = links_created
+        except Exception as e:
+            logger.error("pipeline_correlation_error", error=str(e))
+            summary["errors"].append(f"correlation: {e}")
 
-            # --- Step 5: Score linked tokens ---
-            linked_tokens = self.token_repo.list_by_status("linked", limit=200)
-            scored_count = 0
+        # Step 5 & 6: Score linked tokens and classify alerts
+        linked_tokens = self.token_repo.list_by_status("linked", limit=200)
+        scored_count = 0
 
-            for token in linked_tokens:
-                token_links = self.link_repo.get_for_token(token["token_id"])
-                for link in token_links:
-                    if link.get("status") != "active":
-                        continue
+        for token in linked_tokens:
+            token_links = self.link_repo.get_for_token(token["token_id"])
+            for link in token_links:
+                if link.get("status") != "active":
+                    continue
 
-                    narrative = self.narrative_repo.get_by_id(link["narrative_id"])
-                    if narrative is None:
-                        continue
+                narrative = self.narrative_repo.get_by_id(link["narrative_id"])
+                if narrative is None:
+                    continue
 
-                    # Build data packages for scorer
+                try:
                     snapshot = self.token_repo.get_latest_snapshot(token["token_id"])
                     chain_data = self._build_chain_data(token, snapshot)
                     narrative_data = self._build_narrative_data(narrative, link)
-                    social_data = {}  # Would come from social adapters
+                    social_data = {}
                     link_data = self._build_link_data(link)
 
                     scored = self.scorer.score_token(
@@ -223,7 +264,7 @@ class Pipeline:
                     self.scoring_repo.save(scored)
                     scored_count += 1
 
-                    # --- Step 6: Alert classification ---
+                    # Step 6: Alert classification
                     alert = self.alert_engine.process_scored_token(
                         scored_token=scored,
                         token=token,
@@ -235,21 +276,42 @@ class Pipeline:
                         summary["alerts_created"] += 1
                         self._total_alerts_generated += 1
 
-                        # --- Step 7: Deliver ---
+                        # Step 7: Deliver and persist delivery records
                         logs = await self.delivery.deliver_alert(alert)
-                        summary["alerts_delivered"] += len(
-                            [l for l in logs if l.get("status") == "delivered"]
+                        for log in logs:
+                            try:
+                                self.alert_repo.save_delivery(log)
+                            except Exception as e:
+                                logger.error("delivery_log_persist_error", error=str(e))
+                        summary["alerts_delivered"] += sum(
+                            1 for l in logs if l.get("status") == "delivered"
                         )
 
-                # Update token status to scored
+                except Exception as e:
+                    logger.error(
+                        "token_scoring_error",
+                        token_id=token.get("token_id"),
+                        link_id=link.get("link_id"),
+                        error=str(e),
+                    )
+                    summary["errors"].append(
+                        f"score:{token.get('token_id')}:{link.get('link_id')}: {e}"
+                    )
+
+            try:
                 self.token_repo.update_status(
                     token["token_id"], "scored", "scoring_complete"
                 )
+            except Exception as e:
+                logger.error("token_status_update_error",
+                             token_id=token.get("token_id"), error=str(e))
 
-            summary["tokens_scored"] = scored_count
-            self._total_tokens_processed += scored_count
+        summary["tokens_scored"] = scored_count
+        self._total_tokens_processed += scored_count
 
-            # --- Step 8: Check expired alerts ---
+        # Step 8: Expire stale alerts and retire old ones
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
             expired = self.alert_engine.check_expired_alerts()
             for exp_alert in expired:
                 logger.info(
@@ -257,10 +319,44 @@ class Pipeline:
                     alert_id=exp_alert.get("alert_id"),
                     type=exp_alert.get("alert_type"),
                 )
+            summary["alerts_expired"] = len(expired)
+
+            # Purge alerts older than retention window
+            if self.settings is not None:
+                retention_hours = self.settings.retired_alert_retention_hours
+            else:
+                retention_hours = 168  # 7 days default
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+            purged_alerts = self.alert_repo.purge_old_retired(cutoff.isoformat())
+            if purged_alerts:
+                logger.info("old_alerts_purged", count=purged_alerts)
 
         except Exception as e:
-            logger.error("pipeline_cycle_error", error=str(e), cycle=self._cycle_count)
-            summary["errors"].append(str(e))
+            logger.error("pipeline_expiry_error", error=str(e))
+            summary["errors"].append(f"expiry: {e}")
+
+        # Step 9: Prune old data per retention policy (every cycle)
+        try:
+            if self.settings is not None:
+                snap_hours = self.settings.chain_snapshot_retention_hours
+                score_hours = self.settings.scored_token_retention_hours
+            else:
+                snap_hours = 48
+                score_hours = 72
+
+            snap_cutoff = datetime.now(timezone.utc) - timedelta(hours=snap_hours)
+            score_cutoff = datetime.now(timezone.utc) - timedelta(hours=score_hours)
+
+            pruned_snaps = self.token_repo.prune_old_snapshots(snap_cutoff.isoformat())
+            pruned_scores = self.scoring_repo.prune_old_scored_tokens(score_cutoff.isoformat())
+            total_pruned = pruned_snaps + pruned_scores
+            if total_pruned:
+                logger.info("data_pruned",
+                            snapshots=pruned_snaps, scored_tokens=pruned_scores)
+            summary["rows_pruned"] = total_pruned
+        except Exception as e:
+            logger.error("pipeline_pruning_error", error=str(e))
+            summary["errors"].append(f"pruning: {e}")
 
         elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
         summary["elapsed_seconds"] = round(elapsed, 2)
@@ -270,6 +366,7 @@ class Pipeline:
 
     def get_stats(self) -> dict:
         """Return pipeline statistics."""
+        db_size_mb = round(self.db.get_size_bytes() / (1024 * 1024), 2)
         return {
             "cycles_completed": self._cycle_count,
             "total_tokens_processed": self._total_tokens_processed,
@@ -277,6 +374,7 @@ class Pipeline:
             "source_health": self.ingestion.get_source_health(),
             "active_alerts": len(self.alert_repo.get_active()),
             "open_source_gaps": len(self.gap_repo.get_open_gaps()),
+            "db_size_mb": db_size_mb,
         }
 
     # --- Data building helpers ---
@@ -322,7 +420,6 @@ class Pipeline:
         first_detected = narrative.get("first_detected", "")
         now = datetime.now(timezone.utc)
 
-        # Calculate narrative age in hours
         age_hours = 0.0
         if first_detected:
             try:
@@ -347,6 +444,6 @@ class Pipeline:
         return {
             "og_rank": link.get("og_rank"),
             "og_score": link.get("og_score"),
-            "cross_source_mentions": 0,  # Would come from cross-source analysis
+            "cross_source_mentions": 0,
             "match_method": link.get("match_method", "exact"),
         }
