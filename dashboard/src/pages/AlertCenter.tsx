@@ -1,3 +1,19 @@
+/**
+ * Alert Center — narrative-grouped view.
+ *
+ * Primary table: one row per narrative cluster (grouped by narrative_id).
+ * Each row: narrative name, dominant alert type, confidence, token_count,
+ *   alert_count, last_seen.
+ *
+ * Detail panel: narrative board data (live, from /api/narratives/board) +
+ *   child token alerts (from the group's alerts list).
+ *
+ * Confidence shown here is max(confidence_score) within the group, which
+ * varies once the pipeline's _build_narrative_data fix is in effect. For
+ * legacy rows still showing ~47.5%, the board's narrative_score (labeled
+ * "Narrative Score") is shown alongside as the more discriminative metric.
+ */
+
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import {
@@ -16,50 +32,254 @@ import {
   shortAddr,
 } from '../components/ui'
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function alertTypeBadgeVariant(type: string) {
+  return alertTypeBadge(type)
+}
+
+function dominantBadge(type: string) {
+  return <Badge variant={alertTypeBadgeVariant(type)}>{type.replace(/_/g, ' ')}</Badge>
+}
+
+function statusBadge(s: string) {
+  return <Badge variant={s === 'active' ? 'green' : 'gray'}>{s}</Badge>
+}
+
+// Find the best matching board entry for a narrative group.
+// Match on: narrative_name contains a board term OR a token name in the group
+// appears in the board entry's token list.
+function findBoardEntry(group: any, board: any[]): any | null {
+  const name = (group.narrative_name || '').toUpperCase()
+  const tokenNames = new Set(
+    (group.token_names || []).map((n: string) => n.toUpperCase())
+  )
+  for (const entry of board) {
+    const term = (entry.term || '').toUpperCase()
+    if (name.includes(term) || term.includes(name)) return entry
+    const boardTokens = (entry.tokens || []).map((t: any) => (t.name || '').toUpperCase())
+    if (boardTokens.some((bt: string) => tokenNames.has(bt))) return entry
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Narrative group detail panel
+// ---------------------------------------------------------------------------
+
+function NarrativeGroupDetail({
+  group,
+  boardEntry,
+}: {
+  group: any
+  boardEntry: any | null
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {/* Board entry card — live discovery data */}
+      {boardEntry ? (
+        <Card>
+          <div style={{ fontSize: 11, color: '#6e7681', marginBottom: 8 }}>
+            Live narrative intelligence
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+            <span style={{ fontWeight: 700, fontSize: 14, color: '#c9d1d9' }}>
+              {boardEntry.term}
+            </span>
+            {boardEntry.classification === 'STRONG' && <Badge variant="green">STRONG</Badge>}
+            {boardEntry.classification === 'EMERGING' && <Badge variant="blue">EMERGING</Badge>}
+            {boardEntry.classification === 'WEAK' && <Badge variant="yellow">WEAK</Badge>}
+            {boardEntry.corroboration?.x_confirmed && (
+              <span style={{ fontSize: 10, color: '#bc8cff' }}>X</span>
+            )}
+          </div>
+          <ScoreBar label="Narrative score" value={boardEntry.narrative_score} />
+          <ScoreBar label="Confidence" value={boardEntry.confidence} />
+          <div style={{ marginTop: 8, fontSize: 11, color: '#8b949e', display: 'flex', gap: 12 }}>
+            <span>
+              5m: <strong style={{ color: '#c9d1d9' }}>{boardEntry.velocity?.tokens_last_5m}</strong>
+            </span>
+            <span>
+              15m: <strong style={{ color: '#c9d1d9' }}>{boardEntry.velocity?.tokens_last_15m}</strong>
+            </span>
+            <span>
+              accel:{' '}
+              <strong
+                style={{
+                  color:
+                    boardEntry.velocity?.acceleration === 'increasing'
+                      ? '#3fb950'
+                      : boardEntry.velocity?.acceleration === 'decreasing'
+                      ? '#f85149'
+                      : '#8b949e',
+                }}
+              >
+                {boardEntry.velocity?.acceleration}
+              </strong>
+            </span>
+          </div>
+          {boardEntry.pattern_flags?.length > 0 && (
+            <div style={{ marginTop: 6, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {boardEntry.pattern_flags.map((f: string) => (
+                <span
+                  key={f}
+                  style={{
+                    fontSize: 10,
+                    color: '#8b949e',
+                    background: 'rgba(139,148,158,0.1)',
+                    borderRadius: 3,
+                    padding: '1px 5px',
+                  }}
+                >
+                  {f === 'repeated' ? '🔁 repeated' : f === 'rapid_spawn' ? '⚡ rapid spawn' : f === 'converging' ? '🧠 converging' : f}
+                </span>
+              ))}
+            </div>
+          )}
+          <div style={{ marginTop: 8, fontSize: 11, color: '#6e7681', lineHeight: 1.5 }}>
+            {boardEntry.reason}
+          </div>
+        </Card>
+      ) : (
+        <Card>
+          <div style={{ fontSize: 11, color: '#6e7681' }}>
+            No live board entry for this narrative yet.
+          </div>
+        </Card>
+      )}
+
+      {/* Child alerts */}
+      {group.alerts?.length > 0 && (
+        <Card>
+          <div style={{ fontSize: 11, color: '#6e7681', marginBottom: 8 }}>
+            Scored token alerts ({group.alerts.length})
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {group.alerts.slice(0, 15).map((a: any, i: number) => (
+              <div
+                key={i}
+                style={{
+                  padding: '8px 0',
+                  borderBottom: '1px solid #21262d',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 4,
+                }}
+              >
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <Badge variant={alertTypeBadgeVariant(a.alert_type)}>
+                    {a.alert_type?.replace(/_/g, ' ')}
+                  </Badge>
+                  <span style={{ fontSize: 12, color: '#c9d1d9', flex: 1 }}>
+                    {a.token_name || shortAddr(a.token_address)}
+                  </span>
+                  <Badge variant={a.status === 'active' ? 'green' : 'gray'}>
+                    {a.status}
+                  </Badge>
+                </div>
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: 16,
+                    fontSize: 11,
+                    color: '#8b949e',
+                  }}
+                >
+                  <span>
+                    Net:{' '}
+                    <strong style={{ color: scoreColor(a.net_potential) }}>
+                      {fmtPct(a.net_potential)}
+                    </strong>
+                  </span>
+                  <span>
+                    P_fail:{' '}
+                    <strong style={{ color: riskColor(a.p_failure) }}>
+                      {fmtPct(a.p_failure)}
+                    </strong>
+                  </span>
+                  <span>
+                    Conf:{' '}
+                    <strong>{fmtPct(a.confidence_score)}</strong>
+                  </span>
+                  <span style={{ color: '#484f58' }}>{fmtDate(a.created_at)}</span>
+                </div>
+                {a.risk_flags?.length > 0 && (
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                    {a.risk_flags.slice(0, 3).map((f: string, fi: number) => (
+                      <Badge key={fi} variant="red">{f}</Badge>
+                    ))}
+                    {a.risk_flags.length > 3 && (
+                      <span style={{ fontSize: 10, color: '#6e7681' }}>
+                        +{a.risk_flags.length - 3} more
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+            {group.alerts.length > 15 && (
+              <div style={{ fontSize: 11, color: '#6e7681', textAlign: 'center' }}>
+                +{group.alerts.length - 15} more alerts
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Main page
+// ---------------------------------------------------------------------------
+
 export function AlertCenter() {
-  const [alerts, setAlerts] = useState<any[]>([])
+  const [groups, setGroups] = useState<any[]>([])
+  const [board, setBoard] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
   const [filter, setFilter] = useState<'all' | 'active' | 'retired'>('all')
   const [selected, setSelected] = useState<any>(null)
-  const [detail, setDetail] = useState<any>(null)
-  const [detailLoading, setDetailLoading] = useState(false)
+
+  const load = async () => {
+    try {
+      const s = filter === 'all' ? undefined : filter
+      const [groupRes, boardRes] = await Promise.all([
+        api.narrativeAlerts(s, 100),
+        api.narrativeBoard(undefined, false).catch(() => ({ board: [] })),
+      ])
+      setGroups(groupRes.groups || [])
+      setBoard(boardRes.board || [])
+      setLoading(false)
+    } catch (e: any) {
+      setErr(e.message)
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
-    const load = async () => {
-      try {
-        const s = filter === 'all' ? undefined : filter
-        const res = await api.alerts(s, 100)
-        setAlerts(res.alerts || [])
-        setLoading(false)
-      } catch (e: any) {
-        setErr(e.message)
-        setLoading(false)
-      }
-    }
+    setLoading(true)
     load()
     const t = setInterval(load, 15000)
     return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter])
-
-  const openDetail = async (alert: any) => {
-    setSelected(alert)
-    setDetailLoading(true)
-    try {
-      const d = await api.alert(alert.alert_id)
-      setDetail(d)
-    } catch (e: any) {
-      setDetail({ error: e.message })
-    } finally {
-      setDetailLoading(false)
-    }
-  }
 
   if (loading) return <Loading />
   if (err) return <ErrorMsg msg={err} />
 
+  const totalAlerts = groups.reduce((s, g) => s + g.alert_count, 0)
+
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: selected ? '1fr 1fr' : '1fr', gap: 16 }}>
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: selected ? '1fr 1fr' : '1fr',
+        gap: 16,
+      }}
+    >
       <div>
         <SectionTitle
           right={
@@ -86,29 +306,59 @@ export function AlertCenter() {
             </div>
           }
         >
-          Alerts ({alerts.length})
+          Alerts — {groups.length} narrative{groups.length !== 1 ? 's' : ''} ({totalAlerts} signals)
         </SectionTitle>
 
-        <Card style={{ padding: 0 }}>
-          <Table
-            headers={['Type', 'Token', 'Net Pot.', 'P_failure', 'Confidence', 'Status', 'Created']}
-            emptyMsg="No alerts found."
-            rows={alerts.map(a => [
-              <Badge variant={alertTypeBadge(a.alert_type)}>{a.alert_type}</Badge>,
-              <span
-                style={{ color: '#58a6ff', cursor: 'pointer' }}
-                onClick={() => openDetail(a)}
-              >
-                {a.token_name || shortAddr(a.token_address)}
-              </span>,
-              <span style={{ color: scoreColor(a.net_potential) }}>{fmtPct(a.net_potential)}</span>,
-              <span style={{ color: riskColor(a.p_failure) }}>{fmtPct(a.p_failure)}</span>,
-              <span>{fmtPct(a.confidence_score)}</span>,
-              <Badge variant={a.status === 'active' ? 'green' : 'gray'}>{a.status}</Badge>,
-              <span style={{ fontSize: 11, color: '#484f58' }}>{fmtDate(a.created_at)}</span>,
-            ])}
-          />
-        </Card>
+        {groups.length === 0 ? (
+          <div style={{ padding: 32, color: '#6e7681', textAlign: 'center', fontSize: 13 }}>
+            No alerts yet. Waiting for pipeline to score tokens.
+          </div>
+        ) : (
+          <Card style={{ padding: 0 }}>
+            <Table
+              headers={['Narrative', 'Type', 'Confidence', 'Tokens', 'Alerts', 'Status', 'Last']}
+              emptyMsg="No alerts found."
+              rows={groups.map(g => {
+                const boardEntry = findBoardEntry(g, board)
+                const conf = g.max_confidence
+                return [
+                  <div>
+                    <span
+                      style={{ color: '#58a6ff', cursor: 'pointer', fontWeight: 600 }}
+                      onClick={() => setSelected(selected?.narrative_id === g.narrative_id ? null : g)}
+                    >
+                      {g.narrative_name}
+                    </span>
+                    {boardEntry && (
+                      <span style={{ marginLeft: 6, fontSize: 10 }}>
+                        {boardEntry.classification === 'STRONG' && <Badge variant="green">STRONG</Badge>}
+                        {boardEntry.classification === 'EMERGING' && <Badge variant="blue">EMERGING</Badge>}
+                        {boardEntry.classification === 'WEAK' && <Badge variant="yellow">WEAK</Badge>}
+                      </span>
+                    )}
+                  </div>,
+                  dominantBadge(g.dominant_alert_type),
+                  <div style={{ minWidth: 70 }}>
+                    <div style={{ color: scoreColor(conf), fontWeight: 600, fontSize: 12 }}>
+                      {fmtPct(conf)}
+                    </div>
+                    {boardEntry && (
+                      <div style={{ fontSize: 10, color: '#6e7681' }}>
+                        score: {fmtPct(boardEntry.narrative_score)}
+                      </div>
+                    )}
+                  </div>,
+                  <span style={{ color: '#c9d1d9' }}>{g.token_count}</span>,
+                  <span style={{ color: '#c9d1d9' }}>{g.alert_count}</span>,
+                  statusBadge(g.status),
+                  <span style={{ fontSize: 11, color: '#484f58' }}>
+                    {fmtDate(g.latest_created_at)}
+                  </span>,
+                ]
+              })}
+            />
+          </Card>
+        )}
       </div>
 
       {selected && (
@@ -116,127 +366,26 @@ export function AlertCenter() {
           <SectionTitle
             right={
               <button
-                onClick={() => { setSelected(null); setDetail(null) }}
-                style={{ background: 'none', border: 'none', color: '#6e7681', cursor: 'pointer', fontSize: 12 }}
+                onClick={() => setSelected(null)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: '#6e7681',
+                  cursor: 'pointer',
+                  fontSize: 12,
+                }}
               >
                 ✕ Close
               </button>
             }
           >
-            Alert Detail
+            {selected.narrative_name}
           </SectionTitle>
-
-          {detailLoading ? (
-            <Loading />
-          ) : detail?.error ? (
-            <ErrorMsg msg={detail.error} />
-          ) : detail ? (
-            <AlertDetail detail={detail} />
-          ) : null}
+          <NarrativeGroupDetail
+            group={selected}
+            boardEntry={findBoardEntry(selected, board)}
+          />
         </div>
-      )}
-    </div>
-  )
-}
-
-function AlertDetail({ detail }: { detail: any }) {
-  const { alert, deliveries } = detail
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      {/* Header */}
-      <Card>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
-          <Badge variant={alertTypeBadge(alert.alert_type)}>{alert.alert_type}</Badge>
-          <Badge variant={alert.status === 'active' ? 'green' : 'gray'}>{alert.status}</Badge>
-        </div>
-        <div style={{ fontSize: 14, color: '#c9d1d9', marginBottom: 8 }}>
-          {alert.token_name} ({alert.token_symbol})
-          {alert.narrative_name && (
-            <span style={{ color: '#6e7681', fontSize: 12 }}> — {alert.narrative_name}</span>
-          )}
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-          <div>
-            <div style={{ color: '#6e7681', fontSize: 10 }}>Net Potential</div>
-            <div style={{ fontWeight: 700, color: scoreColor(alert.net_potential), fontSize: 16 }}>
-              {fmtPct(alert.net_potential)}
-            </div>
-          </div>
-          <div>
-            <div style={{ color: '#6e7681', fontSize: 10 }}>P_failure</div>
-            <div style={{ fontWeight: 700, color: riskColor(alert.p_failure), fontSize: 16 }}>
-              {fmtPct(alert.p_failure)}
-            </div>
-          </div>
-          <div>
-            <div style={{ color: '#6e7681', fontSize: 10 }}>Confidence</div>
-            <div style={{ fontWeight: 700, fontSize: 16 }}>{fmtPct(alert.confidence_score)}</div>
-          </div>
-        </div>
-      </Card>
-
-      {/* Reasoning */}
-      {alert.reasoning && (
-        <Card>
-          <div style={{ fontSize: 11, color: '#6e7681', marginBottom: 8 }}>Why this alert?</div>
-          <div style={{ fontSize: 12, color: '#8b949e', lineHeight: 1.6 }}>{alert.reasoning}</div>
-        </Card>
-      )}
-
-      {/* Scores */}
-      {alert.dimension_scores && (
-        <Card>
-          <div style={{ fontSize: 11, color: '#6e7681', marginBottom: 10 }}>Dimension Scores</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {Object.entries(alert.dimension_scores).map(([k, v]: [string, any]) => (
-              <ScoreBar key={k} label={k.replace(/_/g, ' ')} value={v} />
-            ))}
-          </div>
-        </Card>
-      )}
-
-      {/* Risk flags */}
-      {alert.risk_flags?.length > 0 && (
-        <Card>
-          <div style={{ fontSize: 11, color: '#6e7681', marginBottom: 8 }}>Risk Flags</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            {alert.risk_flags.map((f: string, i: number) => (
-              <Badge key={i} variant="red">{f}</Badge>
-            ))}
-          </div>
-        </Card>
-      )}
-
-      {/* Delivery logs */}
-      {deliveries?.length > 0 && (
-        <Card>
-          <div style={{ fontSize: 11, color: '#6e7681', marginBottom: 8 }}>Delivery Log</div>
-          {deliveries.map((d: any, i: number) => (
-            <div key={i} style={{ display: 'flex', gap: 10, padding: '5px 0', borderBottom: '1px solid #21262d', fontSize: 11 }}>
-              <Badge variant={d.status === 'delivered' ? 'green' : 'red'}>{d.status}</Badge>
-              <span style={{ color: '#8b949e' }}>{d.channel_type}</span>
-              <span style={{ color: '#484f58' }}>{fmtDate(d.attempted_at)}</span>
-              {d.failure_reason && <span style={{ color: '#f85149' }}>{d.failure_reason}</span>}
-            </div>
-          ))}
-        </Card>
-      )}
-
-      {/* History */}
-      {alert.history?.length > 0 && (
-        <Card>
-          <div style={{ fontSize: 11, color: '#6e7681', marginBottom: 8 }}>State History</div>
-          {alert.history.map((h: any, i: number) => (
-            <div key={i} style={{ padding: '5px 0', borderBottom: '1px solid #21262d', fontSize: 11 }}>
-              <div style={{ color: '#8b949e' }}>
-                {h.previous_type ? `${h.previous_type} → ` : ''}{h.new_type}
-                <span style={{ color: '#484f58', marginLeft: 8 }}>{fmtDate(h.timestamp)}</span>
-              </div>
-              {h.reason && <div style={{ color: '#6e7681' }}>{h.reason}</div>}
-            </div>
-          ))}
-        </Card>
       )}
     </div>
   )

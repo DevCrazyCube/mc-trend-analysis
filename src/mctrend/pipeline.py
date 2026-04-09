@@ -1156,6 +1156,8 @@ class Pipeline:
 
     def _build_narrative_data(self, narrative: dict, link: dict) -> dict:
         """Build narrative_data dict for the scorer."""
+        import json as _json
+
         first_detected = narrative.get("first_detected", "")
         now = datetime.now(timezone.utc)
 
@@ -1169,10 +1171,28 @@ class Pipeline:
             except (ValueError, TypeError):
                 pass
 
+        # Real source count: how many distinct source events contributed to this
+        # narrative (not just how many source *types*).  Varies per narrative so
+        # confidence reflects actual evidence depth.
+        sources = narrative.get("sources") or []
+        if isinstance(sources, str):
+            try:
+                sources = _json.loads(sources)
+            except Exception:
+                sources = []
+        source_count = max(1, len(sources)) if isinstance(sources, list) else 1
+
+        # Ambiguity is the inverse of match confidence: a fuzzy name match is
+        # more ambiguous than an exact one.  This makes confidence vary per link.
+        match_confidence = link.get("match_confidence", 0.5)
+        ambiguity_score = round(max(0.0, 1.0 - match_confidence), 4)
+
         return {
-            "match_confidence": link.get("match_confidence", 0.5),
+            "match_confidence": match_confidence,
             "narrative_age_hours": age_hours,
+            "source_count": source_count,            # actual event count, not type count
             "source_type_count": narrative.get("source_type_count", 1),
+            "ambiguity_score": ambiguity_score,      # derived from match quality
             "state": narrative.get("state", "WEAK"),
             "attention_score": narrative.get("attention_score", 0.5),
             "narrative_velocity": narrative.get("narrative_velocity", 0.0),

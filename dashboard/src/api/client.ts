@@ -51,6 +51,13 @@ export const api = {
     req<any>(`/tokens?${status ? `status=${status}&` : ''}limit=${limit}`),
   token: (id: string) => req<any>(`/tokens/${id}`),
 
+  // Alerts — narrative-grouped view
+  narrativeAlerts: (status?: string, limit = 50) =>
+    req<any>(
+      `/alerts/by-narrative?limit=${limit}` +
+      (status ? `&status=${encodeURIComponent(status)}` : '')
+    ),
+
   // Narratives
   narrativeBoard: (classification?: string, includeNoise = false) =>
     req<any>(
