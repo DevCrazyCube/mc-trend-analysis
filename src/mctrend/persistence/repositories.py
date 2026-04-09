@@ -395,6 +395,15 @@ class AlertRepository:
         )
         return _deserialize_row(cursor.fetchone())
 
+    def get_for_token(self, token_id: str, limit: int = 20) -> list[dict]:
+        """Return all alerts for a token (active and retired), newest first."""
+        cursor = self.db.connection.execute(
+            "SELECT * FROM alerts WHERE token_id = ? "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (token_id, limit),
+        )
+        return _deserialize_rows(cursor.fetchall())
+
     def get_active(self, limit: int = 100) -> list[dict]:
         """Return all active alerts, ordered by net_potential descending."""
         cursor = self.db.connection.execute(

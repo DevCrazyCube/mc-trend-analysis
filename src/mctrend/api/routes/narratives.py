@@ -5,7 +5,7 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mctrend.api.auth import require_auth
-from mctrend.api.deps import get_db
+from mctrend.api.deps import get_db, get_narrative_board
 from mctrend.persistence.repositories import (
     LinkRepository,
     NarrativeRepository,
@@ -24,6 +24,54 @@ def _safe_json(val):
         return json.loads(val)
     except Exception:
         return val
+
+
+@router.get("/board")
+async def get_narrative_board_endpoint(
+    classification: str | None = Query(
+        None,
+        description="Filter by classification: NOISE / WEAK / EMERGING / STRONG",
+    ),
+    include_noise: bool = Query(False, description="Include NOISE-classified entries"),
+    limit: int = Query(50, le=200),
+    _: None = Depends(require_auth),
+):
+    """Operator narrative board — token-stream candidates ranked by narrative_score.
+
+    Returns the live narrative board computed from the token stream discovery
+    engine.  Updated each pipeline cycle.  Sorted by narrative_score descending.
+
+    Each entry contains:
+    - term, narrative_score, classification
+    - token_count, tokens (cluster preview)
+    - velocity metrics (5m / 15m / 60m windows, acceleration)
+    - corroboration (X spike, news)
+    - score_breakdown (fully transparent component weights)
+    - reason (plain-English explanation of WHY this narrative is showing up)
+    """
+    board = get_narrative_board()
+
+    result = board if include_noise else [
+        e for e in board if e.get("classification") != "NOISE"
+    ]
+
+    if classification:
+        cls_upper = classification.upper()
+        result = [e for e in result if e.get("classification") == cls_upper]
+
+    result = result[:limit]
+
+    counts: dict[str, int] = {}
+    for entry in board:
+        cls = entry.get("classification", "UNKNOWN")
+        counts[cls] = counts.get(cls, 0) + 1
+
+    return {
+        "board": result,
+        "count": len(result),
+        "total_candidates": len(board),
+        "classification_counts": counts,
+    }
 
 
 @router.get("")

@@ -735,6 +735,7 @@ async def run_continuous(settings: Settings, dashboard: bool = False):
                 "narrative_outcomes": summary.get("competition_outcomes", []),
                 "token_outcomes": summary.get("token_competition_outcomes", []),
             })
+            api_deps.update_narrative_board(summary.get("narrative_board", []))
             broadcast("cycle_complete", summary)
 
             if summary.get("errors"):

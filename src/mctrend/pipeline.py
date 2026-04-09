@@ -31,6 +31,7 @@ from mctrend.narrative.discovery_engine import (
     NarrativeDiscoveryEngine,
     candidate_to_narrative_event,
 )
+from mctrend.narrative.scoring import build_narrative_board
 from mctrend.narrative.entity_extraction import XEntityExtractor
 from mctrend.narrative.entity_tracker import SpikeConfig, XEntityTracker
 from mctrend.narrative.intelligence import (
@@ -206,6 +207,13 @@ class Pipeline:
             "token_stream_candidates_total": 0,
             "token_stream_candidates_emerging": 0,
             "token_stream_top_candidates": [],
+            # Narrative board metrics
+            "narrative_board": [],
+            "narratives_detected": 0,
+            "narratives_strong": 0,
+            "narratives_emerging": 0,
+            "narratives_weak": 0,
+            "narratives_filtered_noise": 0,
             # X spike metrics
             "x_entities_extracted": 0,
             "x_spikes_detected": 0,
@@ -419,6 +427,32 @@ class Pipeline:
             # Cycle summary: token-stream discovery metrics
             discovery_summary = self._narrative_discovery.get_summary()
             summary.update(discovery_summary)
+
+            # --- Build narrative board from all active candidates ---
+            all_candidates = list(self._narrative_discovery._candidates.values())
+            board = build_narrative_board(all_candidates, include_noise=False)
+            summary["narrative_board"] = board
+            # Per-cycle classification counts for logging
+            from collections import Counter as _Counter
+            cls_counts = _Counter(e["classification"] for e in board)
+            summary["narratives_detected"] = len(board)
+            summary["narratives_strong"] = cls_counts.get("STRONG", 0)
+            summary["narratives_emerging"] = cls_counts.get("EMERGING", 0)
+            summary["narratives_weak"] = cls_counts.get("WEAK", 0)
+            summary["narratives_filtered_noise"] = sum(
+                1 for c in all_candidates
+                if c.token_count < 3  # NOISE threshold
+            )
+
+            if board:
+                logger.info(
+                    "narrative_board_computed",
+                    total=len(board),
+                    strong=cls_counts.get("STRONG", 0),
+                    emerging=cls_counts.get("EMERGING", 0),
+                    weak=cls_counts.get("WEAK", 0),
+                    top_terms=[e["term"] for e in board[:5]],
+                )
 
             # Cycle summary: X spike metrics
             summary["x_entities_extracted"] = len(x_candidates)
