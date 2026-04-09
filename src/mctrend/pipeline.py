@@ -27,6 +27,10 @@ from mctrend.correlation.linker import CorrelationEngine
 from mctrend.delivery.channels import DeliveryRouter
 from mctrend.ingestion.manager import IngestionManager
 from mctrend.ingestion.relevance import score_article_relevance, score_narrative_relevance
+from mctrend.narrative.discovery_engine import (
+    NarrativeDiscoveryEngine,
+    candidate_to_narrative_event,
+)
 from mctrend.narrative.entity_extraction import XEntityExtractor
 from mctrend.narrative.entity_tracker import SpikeConfig, XEntityTracker
 from mctrend.narrative.intelligence import (
@@ -110,7 +114,10 @@ class Pipeline:
         self.gap_repo = SourceGapRepository(db)
         self.rejected_repo = RejectedCandidateRepository(db)
 
-        # X emergent narrative detection
+        # Token-stream narrative discovery (primary discovery source)
+        self._narrative_discovery = NarrativeDiscoveryEngine()
+
+        # X emergent entity extraction (corroboration only — not primary)
         self._x_entity_extractor = XEntityExtractor()
         self._x_entity_tracker = XEntityTracker(SpikeConfig())
 
@@ -195,6 +202,14 @@ class Pipeline:
             "x_failure_mode": "healthy",
             "narrative_path_offline": False,
             "scoring_limited_reason": None,
+            # Token-stream narrative discovery metrics
+            "token_stream_candidates_total": 0,
+            "token_stream_candidates_emerging": 0,
+            "token_stream_top_candidates": [],
+            # X spike metrics
+            "x_entities_extracted": 0,
+            "x_spikes_detected": 0,
+            "x_spike_token_matches": 0,
         }
 
         # Step 1: Ingest
@@ -342,51 +357,97 @@ class Pipeline:
                 passed=len(filtered_events),
             )
 
-        # Step 3b: X emergent entity extraction and spike detection.
-        # Extract entities from X-sourced events, update the tracker,
-        # detect spikes, and inject spike-derived narrative events.
+        # Step 3b: Token-stream narrative discovery (PRIMARY) + X corroboration.
+        #
+        # Architecture:
+        #   Primary source  — token stream: repeated terms across launched tokens
+        #   Corroboration   — X spikes: boost existing token-stream candidates
+        #   Independent     — X spikes without token-stream match still produce
+        #                     their own x_spike_detection narrative events
+        #
+        # This inverts the old token→narrative direction:
+        #   narrative candidates emerge from token patterns FIRST,
+        #   then get corroborated by X, news, and other sources.
+        token_stream_events: list[dict] = []
         spike_events: list[dict] = []
+        spikes: list[dict] = []
+        x_candidates: dict = {}
+
         try:
+            # --- 3b-i: Token stream discovery (primary) ---
+            # Use all tokens from the last 2h so the discovery engine sees
+            # the full pattern, not just new tokens from this cycle alone.
+            recent_tokens = self.token_repo.get_recent(hours=2)
+            self._narrative_discovery.process_token_batch(recent_tokens)
+
+            # --- 3b-ii: X entity extraction + spike detection (corroboration) ---
             x_events = [e for e in filtered_events if e.get("source_type") == "social_media"]
             if x_events:
-                candidates = self._x_entity_extractor.extract_from_tweets(x_events)
-                candidates = self._x_entity_extractor.merge_similar(candidates)
-                candidates = self._x_entity_extractor.reject_noise(candidates)
-                self._x_entity_tracker.update(candidates)
+                x_candidates = self._x_entity_extractor.extract_from_tweets(x_events)
+                x_candidates = self._x_entity_extractor.merge_similar(x_candidates)
+                x_candidates = self._x_entity_extractor.reject_noise(x_candidates)
+                self._x_entity_tracker.update(x_candidates)
                 spikes = self._x_entity_tracker.detect_spikes()
-
-                # Correlate spikes with recent tokens
-                recent_tokens = self.token_repo.get_recent(hours=8)
-                for spike in spikes:
-                    token_matches = correlate_spike_with_tokens(spike, recent_tokens)
-                    # Create narrative event for each spike (even without token match)
-                    best_match = token_matches[0] if token_matches else None
-                    spike_event = spike_to_narrative_event(spike, best_match)
-                    spike_events.append(spike_event)
-
-                # Prune stale entities periodically
                 self._x_entity_tracker.prune()
 
-                summary["x_entities_extracted"] = len(candidates)
-                summary["x_spikes_detected"] = len(spikes)
+            # --- 3b-iii: X corroboration applied to token-stream candidates ---
+            # X spikes that match token-stream candidates boost their confidence.
+            # X spikes without a matching candidate are untouched here.
+            if spikes:
+                self._narrative_discovery.apply_x_corroboration(spikes)
+
+            # --- 3b-iv: Emit token-stream narrative events ---
+            emerging = self._narrative_discovery.get_emerging_candidates()
+            for cand in emerging:
+                token_stream_events.append(candidate_to_narrative_event(cand))
+
+            # Prune decayed candidates
+            self._narrative_discovery.prune()
+
+            # --- 3b-v: Emit X spike events for spikes with token matches ---
+            # These are independent of token-stream candidates.  A spike that
+            # matched a candidate already boosted that candidate's confidence;
+            # it still produces a separate x_spike narrative event.
+            if spikes:
+                for spike_token_batch in [self.token_repo.get_recent(hours=8)]:
+                    for spike in spikes:
+                        token_matches = correlate_spike_with_tokens(spike, spike_token_batch)
+                        best_match = token_matches[0] if token_matches else None
+                        spike_event = spike_to_narrative_event(spike, best_match)
+                        spike_events.append(spike_event)
+
+            # Cycle summary: token-stream discovery metrics
+            discovery_summary = self._narrative_discovery.get_summary()
+            summary.update(discovery_summary)
+
+            # Cycle summary: X spike metrics
+            summary["x_entities_extracted"] = len(x_candidates)
+            summary["x_spikes_detected"] = len(spikes)
+            if spikes:
+                recent8 = self.token_repo.get_recent(hours=8)
                 summary["x_spike_token_matches"] = sum(
-                    1 for s in spikes
-                    for _ in correlate_spike_with_tokens(s, recent_tokens)
-                ) if spikes else 0
+                    1 for s in spikes if correlate_spike_with_tokens(s, recent8)
+                )
+                logger.info(
+                    "x_discovery_cycle_complete",
+                    entities_extracted=len(x_candidates),
+                    spikes_detected=len(spikes),
+                    spike_entities=[s["entity"] for s in spikes],
+                )
 
-                if spikes:
-                    logger.info(
-                        "x_discovery_cycle_complete",
-                        entities_extracted=len(candidates),
-                        spikes_detected=len(spikes),
-                        spike_entities=[s["entity"] for s in spikes],
-                    )
+            if emerging:
+                logger.info(
+                    "token_stream_narrative_discovery",
+                    candidates_emerging=len(emerging),
+                    top_candidates=[c.canonical_name for c in emerging[:5]],
+                )
+
         except Exception as e:
-            logger.error("x_entity_processing_error", error=str(e))
-            summary["errors"].append(f"x_entity_processing: {e}")
+            logger.error("narrative_discovery_error", error=str(e))
+            summary["errors"].append(f"narrative_discovery: {e}")
 
-        # Combine regular filtered events with spike-derived events
-        all_events_for_normalization = filtered_events + spike_events
+        # Combine: filtered news/social events + token-stream events + X spike events
+        all_events_for_normalization = filtered_events + token_stream_events + spike_events
 
         new_events = []
         for raw in all_events_for_normalization:
