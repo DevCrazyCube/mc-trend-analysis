@@ -574,16 +574,19 @@ class NarrativeIntelligence:
                     union(nid1, nid2)
                     continue
 
-                # Check shared entity names (name + type must match)
+                # Check shared entity names (name + type must match).
+                # Guard isinstance(e, dict): X adapter stores entities as a
+                # {cashtags, hashtags, urls} dict; iterating over a dict yields
+                # string keys, not entity objects.
                 entities1 = {
                     (e.get("name", "").upper(), e.get("type", ""))
                     for e in (n1.get("entities") or [])
-                    if e.get("name")
+                    if isinstance(e, dict) and e.get("name")
                 }
                 entities2 = {
                     (e.get("name", "").upper(), e.get("type", ""))
                     for e in (n2.get("entities") or [])
-                    if e.get("name")
+                    if isinstance(e, dict) and e.get("name")
                 }
                 if entities1 and entities2 and len(entities1 & entities2) >= 1:
                     union(nid1, nid2)
