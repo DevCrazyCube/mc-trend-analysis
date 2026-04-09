@@ -525,17 +525,12 @@ class Settings(BaseModel):
         False,
         description="Enable X (Twitter) as a narrative source adapter",
     )
-    x_query_terms: list[str] = Field(
-        default_factory=lambda: [
-            "solana memecoin launch",
-            "pump.fun token",
-            "$SOL token launch",
-            "solana token CA",
-        ],
-        description="Search query terms for X API — narrow crypto-specific queries preferred",
+    x_queries_per_cycle: int = Field(
+        10, gt=0, le=50,
+        description="Number of discovery queries to run per cycle (rotated from pool)",
     )
     x_max_requests_per_cycle: int = Field(
-        5, gt=0, le=50,
+        10, gt=0, le=50,
         description="Maximum X API search calls per pipeline cycle (credit budget control)",
     )
     x_signal_strength: float = Field(
@@ -762,6 +757,12 @@ class Settings(BaseModel):
                 cls.model_fields["x_api_bearer_token"].default,
             ),
             x_enabled=env.get("X_ENABLED", "false").lower() in ("1", "true", "yes"),
+            x_queries_per_cycle=int(
+                env.get(
+                    "X_QUERIES_PER_CYCLE",
+                    cls.model_fields["x_queries_per_cycle"].default,
+                )
+            ),
             x_max_requests_per_cycle=int(
                 env.get(
                     "X_MAX_REQUESTS_PER_CYCLE",
@@ -796,9 +797,4 @@ class Settings(BaseModel):
                     cls.model_fields["x_max_cooldown_seconds"].default,
                 )
             ),
-            x_query_terms=[
-                t.strip()
-                for t in env.get("X_QUERY_TERMS", "").split(",")
-                if t.strip()
-            ] or cls.model_fields["x_query_terms"].default_factory(),
         )

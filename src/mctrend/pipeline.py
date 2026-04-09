@@ -27,9 +27,15 @@ from mctrend.correlation.linker import CorrelationEngine
 from mctrend.delivery.channels import DeliveryRouter
 from mctrend.ingestion.manager import IngestionManager
 from mctrend.ingestion.relevance import score_article_relevance, score_narrative_relevance
+from mctrend.narrative.entity_extraction import XEntityExtractor
+from mctrend.narrative.entity_tracker import SpikeConfig, XEntityTracker
 from mctrend.narrative.intelligence import (
     NarrativeConfig,
     NarrativeIntelligence,
+)
+from mctrend.narrative.spike_correlator import (
+    correlate_spike_with_tokens,
+    spike_to_narrative_event,
 )
 from mctrend.normalization.normalizer import (
     merge_narratives,
@@ -103,6 +109,10 @@ class Pipeline:
         self.alert_repo = AlertRepository(db)
         self.gap_repo = SourceGapRepository(db)
         self.rejected_repo = RejectedCandidateRepository(db)
+
+        # X emergent narrative detection
+        self._x_entity_extractor = XEntityExtractor()
+        self._x_entity_tracker = XEntityTracker(SpikeConfig())
 
         # Narrative intelligence engine
         ni_cfg = NarrativeConfig()
@@ -332,8 +342,54 @@ class Pipeline:
                 passed=len(filtered_events),
             )
 
+        # Step 3b: X emergent entity extraction and spike detection.
+        # Extract entities from X-sourced events, update the tracker,
+        # detect spikes, and inject spike-derived narrative events.
+        spike_events: list[dict] = []
+        try:
+            x_events = [e for e in filtered_events if e.get("source_type") == "social_media"]
+            if x_events:
+                candidates = self._x_entity_extractor.extract_from_tweets(x_events)
+                candidates = self._x_entity_extractor.merge_similar(candidates)
+                candidates = self._x_entity_extractor.reject_noise(candidates)
+                self._x_entity_tracker.update(candidates)
+                spikes = self._x_entity_tracker.detect_spikes()
+
+                # Correlate spikes with recent tokens
+                recent_tokens = self.token_repo.get_recent(hours=8)
+                for spike in spikes:
+                    token_matches = correlate_spike_with_tokens(spike, recent_tokens)
+                    # Create narrative event for each spike (even without token match)
+                    best_match = token_matches[0] if token_matches else None
+                    spike_event = spike_to_narrative_event(spike, best_match)
+                    spike_events.append(spike_event)
+
+                # Prune stale entities periodically
+                self._x_entity_tracker.prune()
+
+                summary["x_entities_extracted"] = len(candidates)
+                summary["x_spikes_detected"] = len(spikes)
+                summary["x_spike_token_matches"] = sum(
+                    1 for s in spikes
+                    for _ in correlate_spike_with_tokens(s, recent_tokens)
+                ) if spikes else 0
+
+                if spikes:
+                    logger.info(
+                        "x_discovery_cycle_complete",
+                        entities_extracted=len(candidates),
+                        spikes_detected=len(spikes),
+                        spike_entities=[s["entity"] for s in spikes],
+                    )
+        except Exception as e:
+            logger.error("x_entity_processing_error", error=str(e))
+            summary["errors"].append(f"x_entity_processing: {e}")
+
+        # Combine regular filtered events with spike-derived events
+        all_events_for_normalization = filtered_events + spike_events
+
         new_events = []
-        for raw in filtered_events:
+        for raw in all_events_for_normalization:
             try:
                 normalized = normalize_event(raw)
                 if normalized is None:

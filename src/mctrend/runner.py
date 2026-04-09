@@ -305,7 +305,7 @@ def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
                 XAPIAdapter(
                     bearer_token=settings.x_api_bearer_token,
                     timeout=settings.external_api_timeout_seconds,
-                    query_terms=settings.x_query_terms,
+                    queries_per_cycle=settings.x_queries_per_cycle,
                     max_requests_per_cycle=settings.x_max_requests_per_cycle,
                     signal_strength=settings.x_signal_strength,
                     cooldown_after=settings.x_cooldown_after,

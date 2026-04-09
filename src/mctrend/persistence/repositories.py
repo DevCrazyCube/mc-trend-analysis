@@ -115,6 +115,17 @@ class TokenRepository:
         )
         return _deserialize_rows(cursor.fetchall())
 
+    def get_recent(self, hours: float = 8.0, limit: int = 500) -> list[dict]:
+        """Return tokens created within the last *hours* hours."""
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        cursor = self.db.connection.execute(
+            "SELECT * FROM tokens WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+            (cutoff, limit),
+        )
+        return _deserialize_rows(cursor.fetchall())
+
     def update_status(self, token_id: str, new_status: str, reason: str) -> None:
         """Update a token's status and log the transition reason in updated_at."""
         from datetime import datetime, timezone

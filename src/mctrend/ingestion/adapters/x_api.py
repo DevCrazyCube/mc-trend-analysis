@@ -1,13 +1,14 @@
-"""X (Twitter) API adapter for real-time narrative detection.
+"""X (Twitter) adapter for emergent narrative detection.
 
-Reference: docs/ingestion/x-twitter-integration.md
+Reference: docs/ingestion/x-emergent-narrative-detection.md
 
-X is a first-class, real-time narrative signal layer.  It detects emerging
-narratives earlier than news sources and feeds into the standard
-normalization → narrative detection → correlation flow.
+The X subsystem discovers emerging narratives/entities/topics from broad
+source material, then correlates spikes with token launches.  It is
+**not** a fixed-query crypto keyword scanner.
 
-Polling mode only in this version.  Stream mode is a future extension
-(see design doc).
+Polling mode only in this version.  The adapter uses a rotating pool of
+broad discovery queries across multiple categories to maximise the
+discovery surface within the X API v2 Recent Search budget.
 """
 
 from __future__ import annotations
@@ -24,15 +25,54 @@ from .base import SourceAdapter, logger, retry_fetch
 from .ratelimit_state import RateLimitState, load_state_for_adapter
 
 # ---------------------------------------------------------------------------
-# Defaults
+# Discovery query pool
 # ---------------------------------------------------------------------------
 
-_DEFAULT_QUERY_TERMS = [
-    "solana memecoin launch",
-    "pump.fun token",
-    "$SOL token launch",
-    "solana token CA",
-]
+# Broad, category-based queries designed to catch diverse emergent topics.
+# These are NOT crypto keyword searches.  They probe wide surfaces so the
+# entity extraction layer (Phase C) can discover what is spiking.
+#
+# Categories:
+#   viral       — catch emerging viral content
+#   breaking    — catch breaking news/events
+#   crypto      — retain crypto-adjacent awareness without being narrow
+#   culture     — meme/culture-driven movements
+#   people      — person/org/brand narratives
+#   reactions   — meta-signals of emerging attention
+
+_DISCOVERY_QUERY_POOL: dict[str, list[str]] = {
+    "viral": [
+        '"going viral" lang:en -is:retweet',
+        '"blowing up" lang:en -is:retweet',
+        '"everyone is talking about" lang:en -is:retweet',
+    ],
+    "breaking": [
+        '"breaking:" lang:en -is:retweet',
+        '"just announced" lang:en -is:retweet',
+        '"breaking news" lang:en -is:retweet',
+    ],
+    "crypto": [
+        "solana lang:en -is:retweet",
+        "pump.fun lang:en -is:retweet",
+        "memecoin lang:en -is:retweet",
+        "solana token launch lang:en -is:retweet",
+    ],
+    "culture": [
+        "meme coin lang:en -is:retweet",
+        "crypto meme lang:en -is:retweet",
+        '"new meme" lang:en -is:retweet',
+    ],
+    "people": [
+        '"just said" lang:en -is:retweet',
+        '"is dead" lang:en -is:retweet',
+        '"has been" arrested OR fired OR elected lang:en -is:retweet',
+    ],
+    "reactions": [
+        '"this is huge" lang:en -is:retweet',
+        '"can\'t believe" lang:en -is:retweet',
+        '"no way" lang:en -is:retweet',
+    ],
+}
 
 # Cashtag pattern: $ followed by 2-12 uppercase letters/digits
 _CASHTAG_RE = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,11})\b")
@@ -52,11 +92,22 @@ _ENGAGEMENT_W_REPLIES = 0.2
 _ENGAGEMENT_NORMALISER = 10.0  # log1p(N)/log1p(NORMALISER) → approx 0–1
 
 
+def _build_flat_query_pool(categories: dict[str, list[str]] | None = None) -> list[str]:
+    """Flatten category map into a single ordered list for rotation."""
+    cats = categories or _DISCOVERY_QUERY_POOL
+    pool: list[str] = []
+    for queries in cats.values():
+        pool.extend(queries)
+    return pool
+
+
 class XAPIAdapter(SourceAdapter):
     """Fetch narrative signals from X (Twitter) via API v2 Recent Search.
 
-    **Polling mode:** Queries the X API v2 ``/tweets/search/recent`` endpoint
-    at each pipeline cycle with configurable query terms.
+    **Discovery mode:** Each cycle selects a rotating subset of broad
+    discovery queries from a configurable category pool.  The real
+    intelligence lives in entity extraction from the results, not in
+    what we search for.
 
     **Rate-limit handling:** Same exponential-backoff cooldown pattern as
     :class:`NewsAPIAdapter`.  Cooldown state is persisted to disk via
@@ -71,8 +122,9 @@ class XAPIAdapter(SourceAdapter):
         self,
         bearer_token: str | None = None,
         timeout: float = 10.0,
-        query_terms: list[str] | None = None,
-        max_requests_per_cycle: int = 5,
+        discovery_categories: dict[str, list[str]] | None = None,
+        queries_per_cycle: int = 10,
+        max_requests_per_cycle: int = 10,
         signal_strength: float = 0.5,
         cooldown_after: int = 2,
         cooldown_seconds: float = 60.0,
@@ -83,9 +135,13 @@ class XAPIAdapter(SourceAdapter):
         self.bearer_token = bearer_token
         self.timeout = timeout
         self.base_url = "https://api.x.com/2"
-        self.query_terms = query_terms or list(_DEFAULT_QUERY_TERMS)
-        self.max_requests_per_cycle = max_requests_per_cycle
         self.signal_strength = signal_strength
+
+        # Discovery query pool and rotation
+        self._query_pool = _build_flat_query_pool(discovery_categories)
+        self._queries_per_cycle = min(queries_per_cycle, len(self._query_pool))
+        self.max_requests_per_cycle = max_requests_per_cycle
+        self._cycle_index: int = 0  # rotation counter
 
         # Rate-limit cooldown policy
         self._cooldown_after = cooldown_after
@@ -121,6 +177,31 @@ class XAPIAdapter(SourceAdapter):
         self._client: httpx.AsyncClient | None = None
 
     # ------------------------------------------------------------------
+    # Discovery query rotation
+    # ------------------------------------------------------------------
+
+    def _select_queries_for_cycle(self) -> list[str]:
+        """Select the next subset of discovery queries via round-robin rotation.
+
+        Each cycle advances the rotation index, ensuring different queries
+        are used on successive cycles.  This maximises the discovery surface
+        across cycles while staying within the per-cycle API budget.
+        """
+        pool_size = len(self._query_pool)
+        if pool_size == 0:
+            return []
+
+        n = min(self._queries_per_cycle, pool_size, self.max_requests_per_cycle)
+        start = self._cycle_index % pool_size
+        self._cycle_index += n
+
+        # Wrap-around selection
+        if start + n <= pool_size:
+            return self._query_pool[start:start + n]
+        else:
+            return self._query_pool[start:] + self._query_pool[:n - (pool_size - start)]
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
@@ -140,7 +221,7 @@ class XAPIAdapter(SourceAdapter):
         return meta
 
     async def fetch(self) -> list[dict]:
-        """Fetch recent tweets matching query terms.
+        """Fetch recent tweets from the rotating discovery query pool.
 
         Returns event dicts compatible with ``normalize_event()``.
         """
@@ -163,13 +244,15 @@ class XAPIAdapter(SourceAdapter):
             all_tweets: list[dict] = []
             requests_made = 0
 
-            for query in self.query_terms:
+            cycle_queries = self._select_queries_for_cycle()
+
+            for query in cycle_queries:
                 if requests_made >= self.max_requests_per_cycle:
                     break
 
                 async def _do_fetch(q=query):
                     params = {
-                        "query": f"{q} lang:en -is:retweet",
+                        "query": q,
                         "max_results": 10,
                         "tweet.fields": "created_at,public_metrics,author_id,entities",
                         "expansions": "author_id",
@@ -213,6 +296,7 @@ class XAPIAdapter(SourceAdapter):
                 raw_count=len(all_tweets),
                 events_produced=len(events),
                 requests_made=requests_made,
+                queries_used=len(cycle_queries),
             )
             return events
 
@@ -387,7 +471,7 @@ class XAPIAdapter(SourceAdapter):
             "_title": description,
             "_description": "",
             "_source_name": author_display,
-            # X-specific metadata (preserved through normalization via entities)
+            # X-specific metadata
             "entities": {
                 "cashtags": cashtag_terms,
                 "hashtags": hashtag_terms,
@@ -410,7 +494,7 @@ class XAPIAdapter(SourceAdapter):
         Uses log-scale to compress viral outliers:
         score = w_rt * log1p(retweets) + w_likes * log1p(likes)
               + w_replies * log1p(replies)
-        Normalised against a reference value so typical tweets score 0.0–1.0.
+        Normalised against a reference value so typical tweets score 0.0-1.0.
         """
         retweets = max(0, metrics.get("retweet_count", 0))
         likes = max(0, metrics.get("like_count", 0))
@@ -469,7 +553,7 @@ class XAPIAdapter(SourceAdapter):
     # ------------------------------------------------------------------
 
     def _handle_403(self) -> None:
-        """Handle HTTP 403 Forbidden — authorization/configuration failure.
+        """Handle HTTP 403 Forbidden -- authorization/configuration failure.
 
         403 is NOT retried (handled upstream by retry_fetch predicate) and does
         NOT enter rate-limit cooldown.  It is a permanent signal that the
@@ -543,7 +627,7 @@ class XAPIAdapter(SourceAdapter):
         try:
             client = await self._get_client()
             params = {
-                "query": "solana lang:en -is:retweet",
+                "query": "lang:en -is:retweet",
                 "max_results": 1,
                 "tweet.fields": "id",
             }
@@ -560,9 +644,9 @@ class XAPIAdapter(SourceAdapter):
             if code == 429:
                 return True, "rate-limited (token is valid)"
             if code == 403:
-                return False, "forbidden — token lacks Recent Search access"
+                return False, "forbidden -- token lacks Recent Search access"
             if code == 401:
-                return False, "unauthorized — token is invalid"
+                return False, "unauthorized -- token is invalid"
             return False, f"HTTP {code}"
         except Exception as e:
             return False, f"unreachable ({e})"

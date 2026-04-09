@@ -18,7 +18,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from mctrend.ingestion.adapters.x_api import XAPIAdapter, _ENGAGEMENT_NORMALISER
+from mctrend.ingestion.adapters.x_api import (
+    XAPIAdapter,
+    _DISCOVERY_QUERY_POOL,
+    _ENGAGEMENT_NORMALISER,
+    _build_flat_query_pool,
+)
 from mctrend.ingestion.adapters.ratelimit_state import RateLimitState
 
 
@@ -479,7 +484,8 @@ class TestFetchBehaviour:
         adapter = XAPIAdapter(
             bearer_token="test",
             max_requests_per_cycle=2,
-            query_terms=["q1", "q2", "q3", "q4"],
+            queries_per_cycle=5,
+            discovery_categories={"test": ["q1", "q2", "q3", "q4"]},
         )
 
         call_count = 0
@@ -755,3 +761,95 @@ class TestForbiddenHandling:
         # pre-seed was _consecutive_429s=1, handle_429 increments to 2 → cooldown
         meta = adapter.get_source_meta()
         assert meta["failure_mode"] == "rate-limited"
+
+
+# ---------------------------------------------------------------------------
+# Discovery query pool and rotation
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoveryQueryPool:
+    def test_default_pool_has_multiple_categories(self):
+        assert len(_DISCOVERY_QUERY_POOL) >= 4
+        for cat, queries in _DISCOVERY_QUERY_POOL.items():
+            assert len(queries) >= 1, f"Category '{cat}' is empty"
+
+    def test_build_flat_query_pool(self):
+        pool = _build_flat_query_pool()
+        total = sum(len(qs) for qs in _DISCOVERY_QUERY_POOL.values())
+        assert len(pool) == total
+
+    def test_custom_categories(self):
+        custom = {"test": ["q1", "q2"], "other": ["q3"]}
+        pool = _build_flat_query_pool(custom)
+        assert pool == ["q1", "q2", "q3"]
+
+    def test_no_hardcoded_crypto_keywords_in_defaults(self):
+        """Discovery pool should NOT contain narrow crypto search phrases."""
+        pool = _build_flat_query_pool()
+        narrow = [
+            "solana memecoin launch",
+            "pump.fun token",
+            "$SOL token launch",
+            "solana token CA",
+        ]
+        for q in pool:
+            assert q not in narrow, f"Narrow crypto query still in pool: {q}"
+
+
+class TestQueryRotation:
+    def test_rotation_selects_correct_count(self):
+        adapter = XAPIAdapter(
+            bearer_token="test",
+            discovery_categories={"a": ["q1", "q2", "q3", "q4", "q5"]},
+            queries_per_cycle=3,
+        )
+        selected = adapter._select_queries_for_cycle()
+        assert len(selected) == 3
+
+    def test_rotation_advances_each_cycle(self):
+        adapter = XAPIAdapter(
+            bearer_token="test",
+            discovery_categories={"a": ["q1", "q2", "q3", "q4", "q5"]},
+            queries_per_cycle=2,
+        )
+        batch1 = adapter._select_queries_for_cycle()
+        batch2 = adapter._select_queries_for_cycle()
+        assert batch1 != batch2, "Successive cycles should use different queries"
+
+    def test_rotation_wraps_around(self):
+        adapter = XAPIAdapter(
+            bearer_token="test",
+            discovery_categories={"a": ["q1", "q2", "q3"]},
+            queries_per_cycle=2,
+        )
+        # Cycle 1: q1, q2
+        batch1 = adapter._select_queries_for_cycle()
+        assert batch1 == ["q1", "q2"]
+        # Cycle 2: q3, q1 (wraps)
+        batch2 = adapter._select_queries_for_cycle()
+        assert batch2 == ["q3", "q1"]
+
+    def test_queries_per_cycle_capped_by_pool_size(self):
+        adapter = XAPIAdapter(
+            bearer_token="test",
+            discovery_categories={"a": ["q1", "q2"]},
+            queries_per_cycle=10,
+        )
+        selected = adapter._select_queries_for_cycle()
+        assert len(selected) == 2
+
+    def test_empty_pool_returns_empty(self):
+        adapter = XAPIAdapter(
+            bearer_token="test",
+            discovery_categories={"a": []},
+            queries_per_cycle=5,
+        )
+        selected = adapter._select_queries_for_cycle()
+        assert selected == []
+
+    def test_adapter_no_longer_accepts_query_terms(self):
+        """The old query_terms parameter must not be accepted."""
+        import inspect
+        sig = inspect.signature(XAPIAdapter.__init__)
+        assert "query_terms" not in sig.parameters
