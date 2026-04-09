@@ -30,6 +30,7 @@ from mctrend.ingestion.adapters.solana_rpc import SolanaRPCAdapter
 from mctrend.ingestion.adapters.trends import SerpAPITrendsAdapter
 from mctrend.ingestion.adapters.x_api import XAPIAdapter
 from mctrend.ingestion.manager import IngestionManager
+from mctrend.ingestion.manager import IngestionManager
 from mctrend.normalization.normalizer import merge_narratives, normalize_event, normalize_token
 from mctrend.persistence.database import Database, SchemaVersionError
 from mctrend.persistence.repositories import (
@@ -181,6 +182,27 @@ def validate_startup(settings: Settings, demo_mode: bool = False) -> list[str]:
 # ---------------------------------------------------------------------------
 # System builder
 # ---------------------------------------------------------------------------
+
+
+async def _run_startup_preflight(ingestion: IngestionManager) -> None:
+    """Run auth preflight checks on event adapters and log results.
+
+    Informational only — a failed check does NOT abort startup.  The goal is
+    to surface credential/configuration problems before the first cycle so the
+    operator can fix them immediately rather than after many failed cycles.
+    """
+    results = await ingestion.run_preflight_checks()
+    for source, (ok, reason) in results.items():
+        if ok:
+            logger.info("startup_source_auth_ok", source=source, reason=reason)
+        else:
+            logger.warning(
+                "startup_source_auth_failed",
+                source=source,
+                authorized=False,
+                reason=reason,
+                hint=f"Narrative signals from '{source}' will be unavailable until the credential is fixed.",
+            )
 
 
 def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
@@ -608,6 +630,9 @@ async def run_once(settings: Settings, demo: bool = False):
         # Brief settle time so first cycle has some events
         await asyncio.sleep(2)
 
+    if not demo:
+        await _run_startup_preflight(pipeline.ingestion)
+
     if demo:
         inject_demo_data(pipeline)
 
@@ -641,6 +666,9 @@ async def run_continuous(settings: Settings, dashboard: bool = False):
     api_deps.set_pipeline_start_time(time.time())
     if ws_adapter is not None:
         api_deps.set_ws_adapter(ws_adapter)
+
+    # Run source auth preflight checks before first cycle
+    await _run_startup_preflight(pipeline.ingestion)
 
     # Start WebSocket adapter background task
     if ws_adapter is not None:

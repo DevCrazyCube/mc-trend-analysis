@@ -618,3 +618,140 @@ class TestTermExtraction:
         terms = adapter._extract_terms("token TOKEN Token different")
         token_count = sum(1 for t in terms if t == "TOKEN")
         assert token_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 403 Forbidden handling
+# ---------------------------------------------------------------------------
+
+
+class TestForbiddenHandling:
+    @pytest.mark.asyncio
+    async def test_403_returns_empty_without_retry(self, adapter):
+        """403 must not be retried — exactly one HTTP call made."""
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403 Forbidden", request=MagicMock(), response=mock_resp)
+        call_count = 0
+
+        async def _once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise exc
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = _once
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            result = await adapter.fetch()
+
+        assert result == []
+        assert call_count == 1, "403 must not be retried"
+
+    @pytest.mark.asyncio
+    async def test_403_sets_failure_mode_forbidden(self, adapter):
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403", request=MagicMock(), response=mock_resp)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(side_effect=exc)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            await adapter.fetch()
+
+        assert adapter._failure_mode == "forbidden"
+
+    @pytest.mark.asyncio
+    async def test_403_does_not_enter_cooldown(self, adapter):
+        """403 is a config failure, not a rate limit — must not enter cooldown."""
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403", request=MagicMock(), response=mock_resp)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(side_effect=exc)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            await adapter.fetch()
+
+        assert adapter.is_in_cooldown() is False
+
+    @pytest.mark.asyncio
+    async def test_403_marks_source_unhealthy(self, adapter):
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403", request=MagicMock(), response=mock_resp)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(side_effect=exc)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            await adapter.fetch()
+
+        assert adapter.is_healthy() is False
+
+    @pytest.mark.asyncio
+    async def test_failure_mode_in_source_meta_after_403(self, adapter):
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403", request=MagicMock(), response=mock_resp)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(side_effect=exc)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            await adapter.fetch()
+
+        meta = adapter.get_source_meta()
+        assert "failure_mode" in meta
+        assert meta["failure_mode"] == "forbidden"
+
+    @pytest.mark.asyncio
+    async def test_failure_mode_healthy_initially(self, adapter):
+        meta = adapter.get_source_meta()
+        assert meta["failure_mode"] == "healthy"
+
+    @pytest.mark.asyncio
+    async def test_failure_mode_resets_to_healthy_after_recovery(self, adapter):
+        """After a successful fetch, failure_mode must reset to 'healthy'."""
+        # Simulate a prior 403
+        adapter._failure_mode = "forbidden"
+        adapter._healthy = False
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": []}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            await adapter.fetch()
+
+        assert adapter._failure_mode == "healthy"
+        assert adapter.is_healthy() is True
+
+    @pytest.mark.asyncio
+    async def test_200_empty_data_marks_healthy(self, adapter):
+        """200 response with empty data list should still mark source as healthy."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": []}
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            result = await adapter.fetch()
+
+        assert result == []
+        assert adapter.is_healthy() is True
+        assert adapter._failure_mode == "healthy"
+
+    @pytest.mark.asyncio
+    async def test_failure_mode_rate_limited_when_in_cooldown(self, adapter):
+        """When in cooldown, get_source_meta() must report failure_mode='rate-limited'."""
+        adapter._consecutive_429s = 1
+        adapter._handle_429()  # triggers cooldown (threshold=2 reached with pre-seed)
+        # pre-seed was _consecutive_429s=1, handle_429 increments to 2 → cooldown
+        meta = adapter.get_source_meta()
+        assert meta["failure_mode"] == "rate-limited"

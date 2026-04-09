@@ -55,6 +55,25 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def _source_failure_mode(meta: dict) -> str:
+    """Compute the current failure mode for a source from its health metadata.
+
+    Returns one of:
+      - ``"healthy"``     — source is operational
+      - ``"rate-limited"`` — source is in rate-limit cooldown (429)
+      - ``"forbidden"``   — source returned 403 (auth/config failure)
+      - ``"unavailable"`` — source is unhealthy for another reason
+      - ``"unconfigured"`` — meta is empty (adapter not registered)
+    """
+    if not meta:
+        return "unconfigured"
+    if meta.get("in_rate_limit_cooldown"):
+        return "rate-limited"
+    if meta.get("healthy", True):
+        return "healthy"
+    return meta.get("failure_mode", "unavailable")
+
+
 class Pipeline:
     """Full processing pipeline from ingestion to delivery."""
 
@@ -161,7 +180,9 @@ class Pipeline:
             "errors": [],
             # Degraded-mode indicators: populated during ingest step
             "news_source_available": True,
+            "news_failure_mode": "healthy",
             "x_source_available": True,
+            "x_failure_mode": "healthy",
             "narrative_path_offline": False,
             "scoring_limited_reason": None,
         }
@@ -196,54 +217,56 @@ class Pipeline:
                         self.ingestion.mark_source_recovered(source_name)
             summary["source_cooldown_active"] = cooldown_count
 
-            # Degraded-mode detection: check whether the news/narrative path is live.
-            # A news source is considered offline when it is unhealthy OR in rate-limit
-            # cooldown (both result in zero articles this cycle).
+            # Degraded-mode detection: classify each narrative source by failure_mode.
+            # Only set offline when a source IS registered but degraded —
+            # an unregistered source ("unconfigured") is not an outage.
             source_health = self.ingestion.get_source_health()
+
             news_meta = source_health.get("newsapi", {})
-            news_healthy = news_meta.get("healthy", True)
-            news_in_cooldown = news_meta.get("in_rate_limit_cooldown", False)
-            news_available = bool(news_meta) and news_healthy and not news_in_cooldown
-            # If no news adapter is registered at all, treat as "no news source" —
-            # not an outage, just unconfigured.  Only set offline when a source
-            # is registered but degraded.
-            if news_meta and not news_available:
+            news_fm = _source_failure_mode(news_meta)
+            summary["news_failure_mode"] = news_fm
+            if news_meta and news_fm != "healthy":
                 summary["news_source_available"] = False
-                if news_in_cooldown:
+                summary["narrative_path_offline"] = True
+                if news_fm == "rate-limited":
                     remaining = news_meta.get("cooldown_remaining_seconds", 0)
                     reason = (
                         f"newsapi rate-limited (cooldown {remaining:.0f}s remaining, "
                         f"episode {news_meta.get('cooldown_episodes', '?')})"
                     )
+                elif news_fm == "forbidden":
+                    reason = "newsapi forbidden (check NEWSAPI_KEY)"
                 else:
-                    reason = "newsapi unhealthy"
-                summary["narrative_path_offline"] = True
+                    reason = f"newsapi {news_fm}"
                 summary["scoring_limited_reason"] = reason
                 logger.warning(
                     "pipeline_degraded_mode",
+                    source="newsapi",
+                    failure_mode=news_fm,
                     reason=reason,
                     tokens_available=len(raw_tokens) > 0,
-                    hint="Tokens will be ingested but narrative-driven scoring will be zero until news source recovers.",
+                    hint="Tokens will be ingested but narrative-driven scoring will be zero until source recovers.",
                 )
 
-            # X (Twitter) degraded-mode detection
             x_meta = source_health.get("x", {})
-            x_healthy = x_meta.get("healthy", True)
-            x_in_cooldown = x_meta.get("in_rate_limit_cooldown", False)
-            x_available = bool(x_meta) and x_healthy and not x_in_cooldown
-            if x_meta and not x_available:
+            x_fm = _source_failure_mode(x_meta)
+            summary["x_failure_mode"] = x_fm
+            if x_meta and x_fm != "healthy":
                 summary["x_source_available"] = False
-                if x_in_cooldown:
+                if x_fm == "rate-limited":
                     x_remaining = x_meta.get("cooldown_remaining_seconds", 0)
                     x_reason = (
                         f"x rate-limited (cooldown {x_remaining:.0f}s remaining, "
                         f"episode {x_meta.get('cooldown_episodes', '?')})"
                     )
+                elif x_fm == "forbidden":
+                    x_reason = "x forbidden (check X_API_BEARER_TOKEN)"
                 else:
-                    x_reason = "x unhealthy"
+                    x_reason = f"x {x_fm}"
                 logger.warning(
                     "pipeline_degraded_mode",
                     source="x",
+                    failure_mode=x_fm,
                     reason=x_reason,
                     hint="X narrative detection unavailable; pipeline continues with other sources.",
                 )

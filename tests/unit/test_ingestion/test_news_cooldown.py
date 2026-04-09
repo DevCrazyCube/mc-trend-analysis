@@ -168,6 +168,82 @@ class TestSourceMeta:
         assert meta["cooldown_remaining_seconds"] > 0
 
 
+class TestForbiddenHandling:
+    """403 Forbidden must not be retried and must set failure_mode='forbidden'."""
+
+    @pytest.mark.asyncio
+    async def test_403_not_retried(self, adapter):
+        """403 must be raised immediately — exactly one HTTP call."""
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403 Forbidden", request=MagicMock(), response=mock_resp)
+        call_count = 0
+
+        async def _once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise exc
+
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = _once
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            result = await adapter.fetch()
+
+        assert result == []
+        assert call_count == 1, "403 must not be retried"
+
+    @pytest.mark.asyncio
+    async def test_403_sets_failure_mode_forbidden(self, adapter):
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403", request=MagicMock(), response=mock_resp)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(side_effect=exc)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            await adapter.fetch()
+
+        assert adapter._failure_mode == "forbidden"
+
+    @pytest.mark.asyncio
+    async def test_403_does_not_enter_cooldown(self, adapter):
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403", request=MagicMock(), response=mock_resp)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(side_effect=exc)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            await adapter.fetch()
+
+        assert adapter.is_in_cooldown() is False
+
+    @pytest.mark.asyncio
+    async def test_failure_mode_in_meta_after_403(self, adapter):
+        mock_resp = MagicMock(status_code=403)
+        exc = httpx.HTTPStatusError("403", request=MagicMock(), response=mock_resp)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.get = AsyncMock(side_effect=exc)
+
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            await adapter.fetch()
+
+        meta = adapter.get_source_meta()
+        assert meta.get("failure_mode") == "forbidden"
+
+    def test_failure_mode_healthy_initially(self, adapter):
+        meta = adapter.get_source_meta()
+        assert meta.get("failure_mode") == "healthy"
+
+    def test_failure_mode_rate_limited_when_in_cooldown(self, adapter):
+        adapter._consecutive_429s = 1
+        adapter._handle_429()
+        meta = adapter.get_source_meta()
+        assert meta["failure_mode"] == "rate-limited"
+
+
 class TestDefaultQueryTerms:
     def test_default_terms_are_specific(self):
         """Default query terms should be narrow compound phrases, not single broad words."""

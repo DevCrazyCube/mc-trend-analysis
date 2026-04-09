@@ -102,6 +102,7 @@ class XAPIAdapter(SourceAdapter):
         self._consecutive_429s: int = 0
         self._cooldown_episodes: int = 0
         self._cooldown_until: float = 0.0  # monotonic timestamp
+        self._failure_mode: str = "healthy"  # healthy | rate-limited | forbidden | unavailable
 
         if self._persisted is not None:
             self._consecutive_429s = self._persisted.consecutive_429s
@@ -134,6 +135,8 @@ class XAPIAdapter(SourceAdapter):
         remaining = max(0.0, self._cooldown_until - time.monotonic())
         meta["cooldown_remaining_seconds"] = round(remaining, 1) if remaining > 0 else 0.0
         meta["cooldown_episodes"] = self._cooldown_episodes
+        # Computed failure_mode: rate-limited supersedes other states when cooldown active
+        meta["failure_mode"] = "rate-limited" if self.is_in_cooldown() else self._failure_mode
         return meta
 
     async def fetch(self) -> list[dict]:
@@ -196,8 +199,9 @@ class XAPIAdapter(SourceAdapter):
                     tweet["_user"] = users_by_id.get(tweet.get("author_id", ""), {})
                     all_tweets.append(tweet)
 
-            # Successful cycle: reset 429 state
+            # Successful cycle: reset rate-limit state
             self._consecutive_429s = 0
+            self._failure_mode = "healthy"
             self._mark_healthy()
             self._persist_state(cleared=True)
 
@@ -214,8 +218,12 @@ class XAPIAdapter(SourceAdapter):
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
+                self._failure_mode = "rate-limited"
                 self._handle_429()
+            elif e.response.status_code == 403:
+                self._handle_403()
             else:
+                self._failure_mode = "unavailable"
                 self._mark_unhealthy(str(e))
                 logger.error(
                     "x_source_unavailable",
@@ -224,6 +232,7 @@ class XAPIAdapter(SourceAdapter):
                 )
             return []
         except Exception as e:
+            self._failure_mode = "unavailable"
             self._mark_unhealthy(str(e))
             logger.error("x_source_unavailable", error=str(e))
             return []
@@ -459,6 +468,25 @@ class XAPIAdapter(SourceAdapter):
     # Rate-limit handling (same pattern as NewsAPIAdapter)
     # ------------------------------------------------------------------
 
+    def _handle_403(self) -> None:
+        """Handle HTTP 403 Forbidden — authorization/configuration failure.
+
+        403 is NOT retried (handled upstream by retry_fetch predicate) and does
+        NOT enter rate-limit cooldown.  It is a permanent signal that the
+        bearer token is missing, expired, or lacks Recent Search access.
+        """
+        self._failure_mode = "forbidden"
+        self._mark_unhealthy("HTTP 403 Forbidden")
+        logger.warning(
+            "x_forbidden",
+            hint=(
+                "X API returned 403 Forbidden. "
+                "Check X_API_BEARER_TOKEN is valid and the app has 'Read' permission "
+                "with access to the v2 Recent Search endpoint. "
+                "See: https://developer.twitter.com/en/portal/dashboard"
+            ),
+        )
+
     def _handle_429(self) -> None:
         """Record a 429 response and enter cooldown."""
         self._consecutive_429s += 1
@@ -502,6 +530,42 @@ class XAPIAdapter(SourceAdapter):
             self._persisted.save(self._state_path)
         except Exception as exc:
             logger.warning("x_state_persist_failed", error=str(exc))
+
+    async def check_auth(self) -> tuple[bool, str]:
+        """Make a minimal API call to verify the bearer token is authorized.
+
+        Returns ``(True, reason)`` when the token is usable (even if
+        rate-limited), ``(False, reason)`` when the token is invalid or lacks
+        access.  Consumes one API call / one search result.
+        """
+        if not self.bearer_token:
+            return False, "no bearer token configured"
+        try:
+            client = await self._get_client()
+            params = {
+                "query": "solana lang:en -is:retweet",
+                "max_results": 1,
+                "tweet.fields": "id",
+            }
+            headers = {"Authorization": f"Bearer {self.bearer_token}"}
+            r = await client.get(
+                f"{self.base_url}/tweets/search/recent",
+                params=params,
+                headers=headers,
+            )
+            r.raise_for_status()
+            return True, "authorized"
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code == 429:
+                return True, "rate-limited (token is valid)"
+            if code == 403:
+                return False, "forbidden — token lacks Recent Search access"
+            if code == 401:
+                return False, "unauthorized — token is invalid"
+            return False, f"HTTP {code}"
+        except Exception as e:
+            return False, f"unreachable ({e})"
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:

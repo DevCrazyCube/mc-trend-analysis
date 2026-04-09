@@ -102,6 +102,25 @@ class IngestionManager:
         """
         self._sources_with_open_gap.discard(source_name)
 
+    async def run_preflight_checks(self) -> dict[str, tuple[bool, str]]:
+        """Run auth/reachability checks on all registered event adapters that support it.
+
+        Called once at startup (before the first pipeline cycle) to surface
+        credential or configuration problems early.  Returns a dict keyed by
+        source_name with ``(authorized: bool, reason: str)`` tuples.
+
+        Does not affect adapter health state — preflight is informational only.
+        """
+        results: dict[str, tuple[bool, str]] = {}
+        for adapter in self._event_adapters:
+            if hasattr(adapter, "check_auth"):
+                try:
+                    ok, reason = await adapter.check_auth()
+                except Exception as exc:
+                    ok, reason = False, f"check_auth raised {exc}"
+                results[adapter.source_name] = (ok, reason)
+        return results
+
     def get_source_health(self) -> dict[str, dict]:
         """Get health status of all registered adapters, keyed by source_name."""
         health: dict[str, dict] = {}

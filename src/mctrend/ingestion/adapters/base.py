@@ -12,17 +12,20 @@ DEFAULT_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 
 def _is_retryable_default(exc: Exception) -> bool:
-    """Default retryability predicate: retry on anything except HTTP 429.
+    """Default retryability predicate: retry on anything except HTTP 429 or 403.
 
-    HTTP 429 (Too Many Requests) is a quota/rate-limit signal, not a
-    transient transport failure.  Retrying immediately against a rate-limited
-    endpoint wastes quota and delays cooldown entry.  All other exceptions
-    (network errors, timeouts, 5xx) are considered transient and retried.
+    - HTTP 429 (Too Many Requests): rate-limit signal; handled by the caller's
+      cooldown logic, not retried.
+    - HTTP 403 (Forbidden): authorization/configuration failure; retrying is
+      pointless and wastes API credits.  The caller must surface this as a
+      configuration error.
+    - All other exceptions (network errors, timeouts, 5xx) are transient and
+      retried with exponential backoff.
     """
     try:
         import httpx
-        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
-            return False
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code not in (403, 429)
     except ImportError:
         pass
     return True
