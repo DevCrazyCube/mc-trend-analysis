@@ -59,10 +59,11 @@ export const api = {
     ),
 
   // Narratives
-  narrativeBoard: (classification?: string, includeNoise = false) =>
+  narrativeBoard: (classification?: string, includeNoise = false, tier?: string) =>
     req<any>(
       `/narratives/board?include_noise=${includeNoise}` +
-      (classification ? `&classification=${encodeURIComponent(classification)}` : '')
+      (classification ? `&classification=${encodeURIComponent(classification)}` : '') +
+      (tier ? `&tier=${encodeURIComponent(tier)}` : '')
     ),
   narratives: (state?: string) =>
     req<any>(`/narratives${state ? `?state=${state}` : ''}`),

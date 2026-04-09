@@ -8,8 +8,21 @@ import {
   ScoreBar,
   SectionTitle,
   fmtDate,
+  fmtPct,
   scoreColor,
 } from '../components/ui'
+
+// ---------------------------------------------------------------------------
+// Tier badge
+// ---------------------------------------------------------------------------
+
+function tierBadge(tier: string) {
+  if (tier === 'T1') return <Badge variant="green">T1 External</Badge>
+  if (tier === 'T2') return <Badge variant="blue">T2 Social</Badge>
+  if (tier === 'T3') return <Badge variant="yellow">T3 Echo</Badge>
+  if (tier === 'T4') return <Badge variant="gray">T4 Noise</Badge>
+  return <Badge variant="gray">{tier}</Badge>
+}
 
 // ---------------------------------------------------------------------------
 // Classification badge
@@ -137,6 +150,68 @@ function VelocityMini({ vel }: { vel: any }) {
 }
 
 // ---------------------------------------------------------------------------
+// Quality breakdown (collapsed by default)
+// ---------------------------------------------------------------------------
+
+function QualityDetail({ breakdown }: { breakdown: any }) {
+  const [open, setOpen] = useState(false)
+  if (!breakdown) return null
+
+  const items = [
+    { label: 'Source gravity', value: breakdown.source_gravity },
+    { label: 'Source diversity', value: breakdown.source_diversity },
+    { label: 'Social scale', value: breakdown.social_scale },
+    { label: 'Velocity', value: breakdown.velocity },
+    { label: 'Semantic gravity', value: breakdown.semantic_gravity },
+    { label: 'Anti-spam', value: breakdown.anti_spam },
+  ]
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{
+          background: 'none',
+          border: 'none',
+          color: '#58a6ff',
+          cursor: 'pointer',
+          fontSize: 11,
+          padding: 0,
+        }}
+      >
+        {open ? '▾' : '▸'} quality breakdown
+      </button>
+      {open && (
+        <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
+          {items.map(({ label, value }) => (
+            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+              <span style={{ color: '#8b949e', minWidth: 100 }}>{label}</span>
+              <div style={{
+                flex: 1,
+                height: 6,
+                background: '#21262d',
+                borderRadius: 3,
+                overflow: 'hidden',
+              }}>
+                <div style={{
+                  height: '100%',
+                  width: `${(value ?? 0) * 100}%`,
+                  background: scoreColor(value ?? 0),
+                  borderRadius: 3,
+                }} />
+              </div>
+              <span style={{ color: '#c9d1d9', fontSize: 10, minWidth: 30, textAlign: 'right' }}>
+                {fmtPct(value)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Narrative card
 // ---------------------------------------------------------------------------
 
@@ -144,28 +219,46 @@ function NarrativeCard({ entry }: { entry: any }) {
   const vel = entry.velocity || {}
   const corr = entry.corroboration || {}
   const score = entry.narrative_score ?? 0
+  const quality = entry.quality_score ?? 0
 
   return (
     <Card style={{ marginBottom: 10 }}>
       {/* Header row */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
         <span style={{ fontWeight: 700, fontSize: 14, color: '#c9d1d9' }}>{entry.term}</span>
+        {entry.tier && tierBadge(entry.tier)}
         {clsBadge(entry.classification)}
         {corr.x_confirmed && (
-          <span style={{ fontSize: 10, color: '#bc8cff' }}>X corroborated</span>
+          <span style={{ fontSize: 10, color: '#bc8cff' }}>
+            X ({corr.x_authors || 0} authors)
+          </span>
         )}
         {corr.news_confirmed && (
-          <span style={{ fontSize: 10, color: '#58a6ff' }}>news</span>
+          <span style={{ fontSize: 10, color: '#58a6ff' }}>
+            news ({corr.news_articles || 0})
+          </span>
         )}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: scoreColor(score), fontWeight: 600 }}>
           {(score * 100).toFixed(0)}
         </span>
       </div>
 
-      {/* Score bar */}
-      <div style={{ marginBottom: 8 }}>
-        <ScoreBar value={score} />
+      {/* Score + Quality bars */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 8 }}>
+        <div style={{ flex: 1 }}>
+          <ScoreBar label="Score" value={score} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <ScoreBar label="Quality" value={quality} />
+        </div>
       </div>
+
+      {/* Tier reason */}
+      {entry.tier_reason && (
+        <div style={{ fontSize: 10, color: '#6e7681', marginBottom: 4, fontStyle: 'italic' }}>
+          {entry.tier_reason}
+        </div>
+      )}
 
       {/* Velocity */}
       <VelocityMini vel={vel} />
@@ -175,6 +268,9 @@ function NarrativeCard({ entry }: { entry: any }) {
 
       {/* Token list (collapsed) */}
       <TokenList tokens={entry.tokens || []} clusters={entry.token_clusters || []} />
+
+      {/* Quality breakdown (collapsed) */}
+      <QualityDetail breakdown={entry.quality_breakdown} />
 
       {/* Reason */}
       <div style={{ marginTop: 8, fontSize: 11, color: '#6e7681', lineHeight: 1.5 }}>
@@ -201,18 +297,24 @@ export function NarrativeExplorer() {
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
   const [classFilter, setClassFilter] = useState('')
+  const [tierFilter, setTierFilter] = useState('')
   const [includeNoise, setIncludeNoise] = useState(false)
 
   useEffect(() => {
     const load = async () => {
       setLoading(true)
       try {
-        const res = await api.narrativeBoard(classFilter || undefined, includeNoise)
+        const res = await api.narrativeBoard(
+          classFilter || undefined,
+          includeNoise,
+          tierFilter || undefined,
+        )
         setBoard(res.board || [])
         setMeta({
           count: res.count,
           total: res.total_candidates,
           counts: res.classification_counts || {},
+          tierCounts: res.tier_counts || {},
         })
         setLoading(false)
       } catch (e: any) {
@@ -221,12 +323,13 @@ export function NarrativeExplorer() {
       }
     }
     load()
-  }, [classFilter, includeNoise])
+  }, [classFilter, tierFilter, includeNoise])
 
   if (loading) return <Loading />
   if (err) return <ErrorMsg msg={err} />
 
   const counts = meta.counts || {}
+  const tierCounts = meta.tierCounts || {}
 
   return (
     <div>
@@ -243,6 +346,22 @@ export function NarrativeExplorer() {
               show noise
             </label>
             <select
+              value={tierFilter}
+              onChange={e => setTierFilter(e.target.value)}
+              style={{
+                background: '#21262d', color: '#c9d1d9',
+                border: '1px solid #30363d', borderRadius: 4,
+                padding: '4px 8px', fontSize: 12,
+              }}
+            >
+              <option value="">All tiers</option>
+              {['T1', 'T2', 'T3', 'T4'].map(t => (
+                <option key={t} value={t}>
+                  {t} {tierCounts[t] ? `(${tierCounts[t]})` : ''}
+                </option>
+              ))}
+            </select>
+            <select
               value={classFilter}
               onChange={e => setClassFilter(e.target.value)}
               style={{
@@ -251,7 +370,7 @@ export function NarrativeExplorer() {
                 padding: '4px 8px', fontSize: 12,
               }}
             >
-              <option value="">All</option>
+              <option value="">All classes</option>
               {['STRONG', 'EMERGING', 'WEAK', 'NOISE'].map(c => (
                 <option key={c} value={c}>
                   {c} {counts[c] ? `(${counts[c]})` : ''}
@@ -264,13 +383,22 @@ export function NarrativeExplorer() {
         Narrative Board ({meta.count ?? board.length})
       </SectionTitle>
 
-      {/* Classification summary bar */}
+      {/* Tier + classification summary bar */}
       {meta.total > 0 && (
-        <div style={{ display: 'flex', gap: 12, marginBottom: 16, fontSize: 11, color: '#8b949e' }}>
-          {counts.STRONG > 0 && <span><strong style={{ color: '#3fb950' }}>{counts.STRONG}</strong> STRONG</span>}
-          {counts.EMERGING > 0 && <span><strong style={{ color: '#58a6ff' }}>{counts.EMERGING}</strong> EMERGING</span>}
-          {counts.WEAK > 0 && <span><strong style={{ color: '#d2a317' }}>{counts.WEAK}</strong> WEAK</span>}
-          {counts.NOISE > 0 && <span><strong style={{ color: '#484f58' }}>{counts.NOISE}</strong> NOISE</span>}
+        <div style={{ display: 'flex', gap: 16, marginBottom: 16, fontSize: 11, color: '#8b949e', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {tierCounts.T1 > 0 && <span><strong style={{ color: '#3fb950' }}>{tierCounts.T1}</strong> T1</span>}
+            {tierCounts.T2 > 0 && <span><strong style={{ color: '#58a6ff' }}>{tierCounts.T2}</strong> T2</span>}
+            {tierCounts.T3 > 0 && <span><strong style={{ color: '#d2a317' }}>{tierCounts.T3}</strong> T3</span>}
+            {tierCounts.T4 > 0 && <span><strong style={{ color: '#484f58' }}>{tierCounts.T4}</strong> T4</span>}
+          </div>
+          <span style={{ color: '#30363d' }}>|</span>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {counts.STRONG > 0 && <span><strong style={{ color: '#3fb950' }}>{counts.STRONG}</strong> STRONG</span>}
+            {counts.EMERGING > 0 && <span><strong style={{ color: '#58a6ff' }}>{counts.EMERGING}</strong> EMERGING</span>}
+            {counts.WEAK > 0 && <span><strong style={{ color: '#d2a317' }}>{counts.WEAK}</strong> WEAK</span>}
+            {counts.NOISE > 0 && <span><strong style={{ color: '#484f58' }}>{counts.NOISE}</strong> NOISE</span>}
+          </div>
           <span style={{ marginLeft: 'auto' }}>{meta.total} candidates total</span>
         </div>
       )}

@@ -35,6 +35,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from mctrend.narrative.quality_scorer import compute_narrative_quality
+from mctrend.narrative.tier_classifier import (
+    TIER_LABEL,
+    TIER_WEIGHT,
+    classify_tier,
+    evidence_from_candidate,
+)
 from mctrend.narrative.token_clustering import add_cluster_info_to_board_entry
 
 if TYPE_CHECKING:
@@ -347,10 +354,20 @@ def to_board_entry(
     classification = classify_narrative(candidate, score)
     reason = build_reason(candidate, score, classification)
 
+    # Tier classification and quality scoring
+    evidence = evidence_from_candidate(candidate)
+    # Inject velocity from the score we already computed
+    evidence.velocity_tokens_5m = score.tokens_last_5m
+    evidence.velocity_tokens_15m = score.tokens_last_15m
+    evidence.acceleration = score.acceleration_label
+
+    tier, tier_reason, tier_categories = classify_tier(evidence)
+    quality = compute_narrative_quality(evidence)
+
     first_seen_dt = datetime.fromtimestamp(candidate.first_seen, tz=timezone.utc)
     last_seen_dt = datetime.fromtimestamp(candidate.last_seen, tz=timezone.utc)
 
-    return {
+    entry = {
         # --- Identity ---
         "candidate_id": candidate.candidate_id,
         "term": candidate.canonical_name,
@@ -360,6 +377,23 @@ def to_board_entry(
         "narrative_score": score.total,
         "classification": classification,
         "confidence": candidate.confidence(now),
+
+        # --- Signal tier (T1–T4) ---
+        "tier": tier,
+        "tier_label": TIER_LABEL.get(tier, tier),
+        "tier_reason": tier_reason,
+        "tier_categories": tier_categories,
+
+        # --- Quality score (0.0–1.0) ---
+        "quality_score": quality.total,
+        "quality_breakdown": {
+            "source_gravity": quality.source_gravity,
+            "source_diversity": quality.source_diversity,
+            "social_scale": quality.social_scale,
+            "velocity": quality.velocity,
+            "semantic_gravity": quality.semantic_gravity,
+            "anti_spam": quality.anti_spam,
+        },
 
         # --- Token cluster ---
         "token_count": candidate.token_count,
@@ -386,8 +420,13 @@ def to_board_entry(
         "corroboration": {
             "x_confirmed": candidate.x_spike_corroboration > 0,
             "x_boost": round(candidate.x_spike_corroboration, 3),
+            "x_authors": candidate.x_author_count,
+            "x_engagement": candidate.x_total_engagement,
+            "x_posts": candidate.x_post_count,
             "news_confirmed": candidate.news_corroboration > 0,
             "news_boost": round(candidate.news_corroboration, 3),
+            "news_articles": candidate.news_article_count,
+            "news_domains": len(candidate.news_domains),
         },
 
         # --- Score breakdown (fully transparent) ---
@@ -410,7 +449,7 @@ def to_board_entry(
         # --- Explainability ---
         "reason": reason,
 
-        # --- Pattern flags (populated below) ---
+        # --- Pattern flags (populated by cluster info) ---
         "pattern_flags": [],
         "token_clusters": [],
     }
@@ -451,14 +490,19 @@ def build_narrative_board(
         entry = to_board_entry(cand, now)
         if not include_noise and entry["classification"] == CLASS_NOISE:
             continue
+        # T4 (noise tier) is always excluded unless include_noise is set
+        if not include_noise and entry.get("tier") == "T4":
+            continue
         entries.append(entry)
 
-    # Sort: classification weight (STRONG=4 > EMERGING=3 > WEAK=2 > NOISE=1)
-    # then velocity (tokens_last_5m desc) then token_count desc
+    # Sort: tier weight first (T1=4 > T2=3 > T3=2 > T4=1),
+    # then classification weight, then quality score, then velocity
     _cls_weight = {CLASS_STRONG: 4, CLASS_EMERGING: 3, CLASS_WEAK: 2, CLASS_NOISE: 1}
     entries.sort(
         key=lambda e: (
+            TIER_WEIGHT.get(e.get("tier", "T4"), 1),
             _cls_weight.get(e["classification"], 0),
+            e.get("quality_score", 0),
             e["velocity"]["tokens_last_5m"],
             e["token_count"],
         ),

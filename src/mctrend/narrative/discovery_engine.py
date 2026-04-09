@@ -186,6 +186,15 @@ class NarrativeCandidate:
     x_spike_corroboration: float = 0.0
     news_corroboration: float = 0.0
 
+    # X evidence metadata (populated by apply_x_corroboration)
+    x_author_count: int = 0
+    x_total_engagement: int = 0
+    x_post_count: int = 0
+
+    # News evidence metadata (populated by apply_news_corroboration)
+    news_article_count: int = 0
+    news_domains: set[str] = field(default_factory=set)
+
     # Lifecycle state label (informational — does not gate processing)
     state: str = "nascent"
 
@@ -213,14 +222,43 @@ class NarrativeCandidate:
         """Record an alternative raw form for this candidate."""
         self.aliases.add(raw_form)
 
-    def add_x_corroboration(self, spike_ratio: float, match_confidence: float) -> None:
+    def add_x_corroboration(
+        self,
+        spike_ratio: float,
+        match_confidence: float,
+        unique_authors: int = 0,
+        engagement_total: int = 0,
+        mention_count: int = 0,
+    ) -> None:
         """Boost confidence from an X spike that matches this candidate.
 
         Non-destructive: takes the max (so multiple spikes don't double-count).
+        Also accumulates X evidence metrics for tier classification.
         """
         boost = min(1.0, (spike_ratio / 20.0) * match_confidence)
         if boost > self.x_spike_corroboration:
             self.x_spike_corroboration = boost
+
+        # Accumulate X evidence (take max for author/engagement, sum for posts)
+        self.x_author_count = max(self.x_author_count, unique_authors)
+        self.x_total_engagement = max(self.x_total_engagement, engagement_total)
+        self.x_post_count = max(self.x_post_count, mention_count)
+
+    def add_news_corroboration(
+        self,
+        corroboration_score: float,
+        article_count: int = 1,
+        domain: str = "",
+    ) -> None:
+        """Record news evidence for this candidate.
+
+        Takes the max corroboration score (non-destructive).
+        Accumulates article count and distinct domains.
+        """
+        self.news_corroboration = max(self.news_corroboration, corroboration_score)
+        self.news_article_count = max(self.news_article_count, article_count)
+        if domain:
+            self.news_domains.add(domain)
 
     # ------------------------------------------------------------------
     # Derived metrics
@@ -331,7 +369,12 @@ class NarrativeCandidate:
             ).isoformat(),
             "age_seconds": round(self.age_seconds, 1),
             "x_spike_corroboration": round(self.x_spike_corroboration, 3),
+            "x_author_count": self.x_author_count,
+            "x_total_engagement": self.x_total_engagement,
+            "x_post_count": self.x_post_count,
             "news_corroboration": round(self.news_corroboration, 3),
+            "news_article_count": self.news_article_count,
+            "news_domain_count": len(self.news_domains),
             "confidence": self.confidence(now),
             "emergence_score": self.emergence_score(now=now),
             "state": self.state,
@@ -572,13 +615,22 @@ class NarrativeDiscoveryEngine:
             if not entity:
                 continue
             spike_ratio = float(spike.get("spike_ratio", 1.0))
+            unique_authors = int(spike.get("unique_authors", 0))
+            engagement_total = int(spike.get("engagement_total", 0))
+            mention_count = int(spike.get("mention_count", 0))
 
             for canon, cand in self._candidates.items():
                 sim = trigram_jaccard(entity, canon)
                 exact = entity == canon
                 if exact or sim >= self.x_corr_threshold:
                     match_confidence = 1.0 if exact else min(1.0, sim + 0.1)
-                    cand.add_x_corroboration(spike_ratio, match_confidence)
+                    cand.add_x_corroboration(
+                        spike_ratio,
+                        match_confidence,
+                        unique_authors=unique_authors,
+                        engagement_total=engagement_total,
+                        mention_count=mention_count,
+                    )
                     boosted += 1
                     logger.debug(
                         "narrative_candidate_x_corroboration",
@@ -587,6 +639,8 @@ class NarrativeDiscoveryEngine:
                         similarity=round(sim, 3),
                         spike_ratio=round(spike_ratio, 2),
                         new_x_boost=round(cand.x_spike_corroboration, 3),
+                        x_authors=unique_authors,
+                        x_engagement=engagement_total,
                     )
         return boosted
 

@@ -32,6 +32,12 @@ from mctrend.narrative.discovery_engine import (
     candidate_to_narrative_event,
 )
 from mctrend.narrative.scoring import build_narrative_board
+from mctrend.narrative.tier_classifier import (
+    TIER_4,
+    TIER_3,
+    classify_tier,
+    evidence_from_candidate,
+)
 from mctrend.narrative.entity_extraction import XEntityExtractor
 from mctrend.narrative.entity_tracker import SpikeConfig, XEntityTracker
 from mctrend.narrative.intelligence import (
@@ -431,6 +437,7 @@ class Pipeline:
             # --- Build narrative board from all active candidates ---
             all_candidates = list(self._narrative_discovery._candidates.values())
             board = build_narrative_board(all_candidates, include_noise=False)
+            self._current_board = board  # available for tier lookups during alerting
             summary["narrative_board"] = board
             # Per-cycle classification counts for logging
             from collections import Counter as _Counter
@@ -902,6 +909,50 @@ class Pipeline:
                     suppressed_count += 1
                     continue
 
+                # Tier-aware alert policy: T4 never alerts, T3 heavily downweighted
+                narrative_tier = self._get_narrative_tier(narrative)
+                if narrative_tier == TIER_4:
+                    logger.info(
+                        "alert_tier_gate_blocked",
+                        token_id=token.get("token_id"),
+                        narrative_id=narrative.get("narrative_id"),
+                        tier=narrative_tier,
+                        reason="T4 narratives never produce alerts",
+                    )
+                    self._handle_rejection(
+                        scored, token, narrative,
+                        extra_reasons=[{
+                            "code": "tier_4_blocked",
+                            "reason": "T4 (noise) narratives are not eligible for alerts",
+                        }],
+                    )
+                    suppressed_count += 1
+                    continue
+
+                if narrative_tier == TIER_3:
+                    # T3 can only alert if confidence is high enough
+                    conf = scored.get("confidence_score", 0.0)
+                    net = scored.get("net_potential", 0.0)
+                    if conf < 0.6 or net < 0.3:
+                        logger.info(
+                            "alert_tier_gate_downweighted",
+                            token_id=token.get("token_id"),
+                            narrative_id=narrative.get("narrative_id"),
+                            tier=narrative_tier,
+                            confidence=conf,
+                            net_potential=net,
+                            reason="T3 narrative below elevated thresholds",
+                        )
+                        self._handle_rejection(
+                            scored, token, narrative,
+                            extra_reasons=[{
+                                "code": "tier_3_threshold",
+                                "reason": f"T3 (token echo) requires confidence>=0.6 and net>=0.3 (got {conf:.2f}, {net:.2f})",
+                            }],
+                        )
+                        suppressed_count += 1
+                        continue
+
                 # Strict winner-takes-all: only "winner" proceeds
                 if competition_status != "winner":
                     logger.info(
@@ -1208,3 +1259,29 @@ class Pipeline:
             "cross_source_mentions": 0,
             "match_method": link.get("match_method", "exact"),
         }
+
+    def _get_narrative_tier(self, narrative: dict) -> str:
+        """Look up the signal tier for a narrative from the discovery engine.
+
+        Checks the live board first (already computed per cycle), then falls
+        back to computing from the candidate directly.  Returns "T3" as
+        default if no candidate is found (conservative — token-echo tier).
+        """
+        narr_name = narrative.get("description") or narrative.get("name") or ""
+
+        # Try board lookup first (computed this cycle)
+        board = getattr(self, "_current_board", None) or []
+        for entry in board:
+            if entry.get("term", "").upper() == narr_name.upper():
+                return entry.get("tier", TIER_3)
+
+        # Fall back: look up the candidate from the discovery engine
+        from mctrend.narrative.entity_extraction import canonicalize
+        canon = canonicalize(narr_name)
+        if canon and canon in self._narrative_discovery._candidates:
+            candidate = self._narrative_discovery._candidates[canon]
+            evidence = evidence_from_candidate(candidate)
+            tier, _, _ = classify_tier(evidence)
+            return tier
+
+        return TIER_3  # conservative default for unknown narratives

@@ -32,6 +32,14 @@ import {
   shortAddr,
 } from '../components/ui'
 
+function tierBadge(tier: string) {
+  if (tier === 'T1') return <Badge variant="green">T1</Badge>
+  if (tier === 'T2') return <Badge variant="blue">T2</Badge>
+  if (tier === 'T3') return <Badge variant="yellow">T3</Badge>
+  if (tier === 'T4') return <Badge variant="gray">T4</Badge>
+  return null
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -88,14 +96,23 @@ function NarrativeGroupDetail({
             <span style={{ fontWeight: 700, fontSize: 14, color: '#c9d1d9' }}>
               {boardEntry.term}
             </span>
+            {boardEntry.tier && tierBadge(boardEntry.tier)}
             {boardEntry.classification === 'STRONG' && <Badge variant="green">STRONG</Badge>}
             {boardEntry.classification === 'EMERGING' && <Badge variant="blue">EMERGING</Badge>}
             {boardEntry.classification === 'WEAK' && <Badge variant="yellow">WEAK</Badge>}
             {boardEntry.corroboration?.x_confirmed && (
-              <span style={{ fontSize: 10, color: '#bc8cff' }}>X</span>
+              <span style={{ fontSize: 10, color: '#bc8cff' }}>
+                X ({boardEntry.corroboration?.x_authors || 0} authors)
+              </span>
+            )}
+            {boardEntry.corroboration?.news_confirmed && (
+              <span style={{ fontSize: 10, color: '#58a6ff' }}>
+                news ({boardEntry.corroboration?.news_articles || 0})
+              </span>
             )}
           </div>
           <ScoreBar label="Narrative score" value={boardEntry.narrative_score} />
+          <ScoreBar label="Quality" value={boardEntry.quality_score} />
           <ScoreBar label="Confidence" value={boardEntry.confidence} />
           <div style={{ marginTop: 8, fontSize: 11, color: '#8b949e', display: 'flex', gap: 12 }}>
             <span>
@@ -316,7 +333,7 @@ export function AlertCenter() {
         ) : (
           <Card style={{ padding: 0 }}>
             <Table
-              headers={['Narrative', 'Type', 'Confidence', 'Tokens', 'Alerts', 'Status', 'Last']}
+              headers={['Narrative', 'Type', 'Confidence', 'Quality', 'Tokens', 'Alerts', 'Status', 'Last']}
               emptyMsg="No alerts found."
               rows={groups.map(g => {
                 const boardEntry = findBoardEntry(g, board)
@@ -330,7 +347,8 @@ export function AlertCenter() {
                       {g.narrative_name}
                     </span>
                     {boardEntry && (
-                      <span style={{ marginLeft: 6, fontSize: 10 }}>
+                      <span style={{ marginLeft: 6, fontSize: 10, display: 'inline-flex', gap: 4 }}>
+                        {boardEntry.tier && tierBadge(boardEntry.tier)}
                         {boardEntry.classification === 'STRONG' && <Badge variant="green">STRONG</Badge>}
                         {boardEntry.classification === 'EMERGING' && <Badge variant="blue">EMERGING</Badge>}
                         {boardEntry.classification === 'WEAK' && <Badge variant="yellow">WEAK</Badge>}
@@ -348,6 +366,13 @@ export function AlertCenter() {
                       </div>
                     )}
                   </div>,
+                  boardEntry ? (
+                    <span style={{ color: scoreColor(boardEntry.quality_score || 0), fontWeight: 600, fontSize: 12 }}>
+                      {fmtPct(boardEntry.quality_score)}
+                    </span>
+                  ) : (
+                    <span style={{ color: '#484f58', fontSize: 11 }}>—</span>
+                  ),
                   <span style={{ color: '#c9d1d9' }}>{g.token_count}</span>,
                   <span style={{ color: '#c9d1d9' }}>{g.alert_count}</span>,
                   statusBadge(g.status),
