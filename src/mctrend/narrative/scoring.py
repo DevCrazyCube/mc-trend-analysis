@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from mctrend.narrative.token_clustering import add_cluster_info_to_board_entry
+
 if TYPE_CHECKING:
     from mctrend.narrative.discovery_engine import NarrativeCandidate
 
@@ -407,7 +409,14 @@ def to_board_entry(
 
         # --- Explainability ---
         "reason": reason,
+
+        # --- Pattern flags (populated below) ---
+        "pattern_flags": [],
+        "token_clusters": [],
     }
+
+    add_cluster_info_to_board_entry(entry)
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -444,5 +453,15 @@ def build_narrative_board(
             continue
         entries.append(entry)
 
-    entries.sort(key=lambda e: e["narrative_score"], reverse=True)
+    # Sort: classification weight (STRONG=4 > EMERGING=3 > WEAK=2 > NOISE=1)
+    # then velocity (tokens_last_5m desc) then token_count desc
+    _cls_weight = {CLASS_STRONG: 4, CLASS_EMERGING: 3, CLASS_WEAK: 2, CLASS_NOISE: 1}
+    entries.sort(
+        key=lambda e: (
+            _cls_weight.get(e["classification"], 0),
+            e["velocity"]["tokens_last_5m"],
+            e["token_count"],
+        ),
+        reverse=True,
+    )
     return entries

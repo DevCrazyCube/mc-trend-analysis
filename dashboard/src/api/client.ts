@@ -52,6 +52,11 @@ export const api = {
   token: (id: string) => req<any>(`/tokens/${id}`),
 
   // Narratives
+  narrativeBoard: (classification?: string, includeNoise = false) =>
+    req<any>(
+      `/narratives/board?include_noise=${includeNoise}` +
+      (classification ? `&classification=${encodeURIComponent(classification)}` : '')
+    ),
   narratives: (state?: string) =>
     req<any>(`/narratives${state ? `?state=${state}` : ''}`),
   narrative: (id: string) => req<any>(`/narratives/${id}`),
