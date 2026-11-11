@@ -150,6 +150,91 @@ class OGResolutionConfig(BaseModel):
     weights: OGResolutionWeights = Field(default_factory=OGResolutionWeights)
 
 
+class NarrativeIntelligenceConfig(BaseModel):
+    """Configuration for narrative velocity, strength, lifecycle, and competition.
+
+    Reference: docs/intelligence/narrative-intelligence.md.
+    """
+
+    # Velocity
+    velocity_window_minutes: float = Field(
+        30.0, gt=0, description="Time window for velocity computation"
+    )
+    max_velocity: float = Field(
+        0.5, gt=0, description="Events/min that yields velocity_score of 1.0"
+    )
+
+    # Strength weights (must sum to 1.0)
+    strength_w_source_count: float = Field(0.30, ge=0.0, le=1.0)
+    strength_w_velocity: float = Field(0.35, ge=0.0, le=1.0)
+    strength_w_recency: float = Field(0.25, ge=0.0, le=1.0)
+    strength_w_diversity: float = Field(0.10, ge=0.0, le=1.0)
+    max_source_count: int = Field(5, gt=0)
+    recency_decay_minutes: float = Field(120.0, gt=0)
+    max_source_types: int = Field(4, gt=0)
+
+    # Lifecycle thresholds
+    min_sources: int = Field(2, ge=1, description="Minimum source count for EMERGING")
+    weak_threshold: float = Field(0.15, ge=0.0, le=1.0)
+    emerging_threshold: float = Field(0.20, ge=0.0, le=1.0)
+    rising_threshold: float = Field(0.35, ge=0.0, le=1.0)
+    trending_threshold: float = Field(0.55, ge=0.0, le=1.0)
+    trending_min_sources: int = Field(3, ge=1)
+    fading_threshold: float = Field(0.25, ge=0.0, le=1.0)
+    dead_threshold: float = Field(0.10, ge=0.0, le=1.0)
+    dead_timeout_minutes: float = Field(120.0, gt=0)
+
+    # Competition
+    winner_min_strength: float = Field(
+        0.30, ge=0.0, le=1.0, description="Minimum strength for a narrative to win competition"
+    )
+    token_competition_margin: float = Field(
+        0.05, ge=0.0, le=1.0,
+        description="Score margin a non-winner must EXCEED the winner by to override suppression",
+    )
+
+    # Clustering
+    cluster_term_overlap_pct: float = Field(
+        0.50, ge=0.0, le=1.0, description="Min fraction of anchor terms shared to cluster"
+    )
+    cluster_token_overlap_min: int = Field(
+        2, ge=1, description="Min shared linked tokens to cluster two narratives"
+    )
+    cluster_min_source_diversity: int = Field(
+        1, ge=1, description="Min distinct source types for a narrative"
+    )
+
+    # Relevance filtering — article gate and narrative gate
+    articles_min_relevance_score: float = Field(
+        0.20, ge=0.0, le=1.0,
+        description="Minimum relevance score for a raw article to pass the article gate",
+    )
+    narratives_min_relevance_score: float = Field(
+        0.15, ge=0.0, le=1.0,
+        description="Minimum relevance score for a stored narrative to participate in token linking",
+    )
+    relevance_positive_saturation: float = Field(
+        1.5, gt=0.0,
+        description="Sum of positive term weights that yields relevance score of 1.0",
+    )
+    relevance_veto_override_threshold: float = Field(
+        0.15, ge=0.0, le=1.0,
+        description="Crypto signal above this prevents a veto category from suppressing the article",
+    )
+
+    @model_validator(mode="after")
+    def _strength_weights_sum(self) -> NarrativeIntelligenceConfig:
+        total = (
+            self.strength_w_source_count
+            + self.strength_w_velocity
+            + self.strength_w_recency
+            + self.strength_w_diversity
+        )
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"Narrative strength weights must sum to 1.0, got {total:.6f}")
+        return self
+
+
 class CorrelationConfig(BaseModel):
     """Configuration for the correlation / name-matching engine.
 
@@ -295,6 +380,12 @@ class Settings(BaseModel):
     this class.  See docs/rules/engineering-rules.md Rule 2.
     """
 
+    # -- Environment ----------------------------------------------------------
+    environment: str = Field(
+        "demo",
+        description="Deployment environment: 'demo', 'dev', or 'prod'",
+    )
+
     # -- Data source URLs / keys ---------------------------------------------
     solana_rpc_url: str = Field(
         "https://api.mainnet-beta.solana.com",
@@ -311,6 +402,11 @@ class Settings(BaseModel):
     # -- Delivery channels ----------------------------------------------------
     telegram_bot_token: str = Field("", description="Telegram Bot API token")
     telegram_chat_id: str = Field("", description="Telegram chat ID for alert delivery")
+    webhook_url: str = Field("", description="Webhook URL for alert delivery")
+    webhook_secret: str = Field(
+        "",
+        description="HMAC secret for webhook request signing (X-Signature-256 header)",
+    )
 
     # -- Storage --------------------------------------------------------------
     database_path: str = Field(
@@ -344,6 +440,120 @@ class Settings(BaseModel):
         description="Minimum confidence_score to emit any alert",
     )
 
+    # -- Dashboard / API server -----------------------------------------------
+    dashboard_host: str = Field(
+        "127.0.0.1",
+        description="Host/IP for the operator dashboard API server",
+    )
+    dashboard_port: int = Field(
+        8765,
+        gt=0,
+        lt=65536,
+        description="Port for the operator dashboard API server",
+    )
+
+    # -- PumpPortal WebSocket -------------------------------------------------
+    pumpportal_ws_enabled: bool = Field(
+        False,
+        description="Enable real-time token discovery via PumpPortal WebSocket",
+    )
+    pumpportal_ws_url: str = Field(
+        "wss://pumpportal.fun/api/data",
+        description="PumpPortal WebSocket URL",
+    )
+    pumpportal_ws_stale_timeout_seconds: float = Field(
+        120.0,
+        gt=0,
+        description="Seconds without a message before reconnecting the WebSocket",
+    )
+
+    # -- Ingestion adapter parameters -----------------------------------------
+    news_query_terms: list[str] = Field(
+        default_factory=lambda: [
+            "solana token launch",
+            "memecoin crypto",
+            "pump.fun token",
+            "crypto market token",
+        ],
+        description="Search query terms for NewsAPI adapter — narrow market-specific queries preferred over broad single words",
+    )
+    news_page_size: int = Field(
+        10, gt=0, description="Articles per query for NewsAPI adapter"
+    )
+    news_signal_strength: float = Field(
+        0.6, ge=0.0, le=1.0, description="Default signal strength for news events"
+    )
+    newsapi_domains: str = Field(
+        "",
+        description="Comma-separated list of news domains to restrict NewsAPI results (e.g. 'coindesk.com,cointelegraph.com'). Empty = no restriction.",
+    )
+    newsapi_rate_limit_cooldown_after: int = Field(
+        2, ge=1,
+        description="Number of consecutive 429 responses before entering rate-limit cooldown",
+    )
+    newsapi_rate_limit_cooldown_seconds: float = Field(
+        60.0, gt=0,
+        description="Base cooldown duration in seconds after hitting the 429 threshold",
+    )
+    newsapi_rate_limit_max_cooldown_seconds: float = Field(
+        900.0, gt=0,
+        description="Maximum cooldown duration in seconds (caps exponential growth)",
+    )
+    newsapi_rate_limit_state_path: str = Field(
+        "data/newsapi_ratelimit_state.json",
+        description=(
+            "Path to the JSON file that persists NewsAPI rate-limit state across restarts. "
+            "On startup the adapter reads this file and honours any unexpired cooldown "
+            "deadline — preventing an immediate 429 hammer after a restart. "
+            "Set to empty string '' to disable persistence (cooldown resets on restart)."
+        ),
+    )
+    trends_geo: str = Field("US", description="Geographic filter for Google Trends adapter")
+    trends_signal_strength: float = Field(
+        0.7, ge=0.0, le=1.0, description="Default signal strength for trend events"
+    )
+    pumpfun_fetch_limit: int = Field(
+        50, gt=0, description="Number of tokens to fetch per Pump.fun API call"
+    )
+
+    # -- X (Twitter) adapter --------------------------------------------------
+    x_api_bearer_token: str = Field(
+        "",
+        description="X API v2 bearer token for tweet search",
+    )
+    x_enabled: bool = Field(
+        False,
+        description="Enable X (Twitter) as a narrative source adapter",
+    )
+    x_queries_per_cycle: int = Field(
+        10, gt=0, le=50,
+        description="Number of discovery queries to run per cycle (rotated from pool)",
+    )
+    x_max_requests_per_cycle: int = Field(
+        10, gt=0, le=50,
+        description="Maximum X API search calls per pipeline cycle (credit budget control)",
+    )
+    x_signal_strength: float = Field(
+        0.5, ge=0.0, le=1.0,
+        description="Base signal strength for X events (before engagement weighting)",
+    )
+    x_cooldown_after: int = Field(
+        2, ge=1,
+        description="Consecutive 429 responses before entering X rate-limit cooldown",
+    )
+    x_cooldown_seconds: float = Field(
+        60.0, gt=0,
+        description="Base cooldown duration in seconds for X rate-limit",
+    )
+    x_max_cooldown_seconds: float = Field(
+        900.0, gt=0,
+        description="Maximum X cooldown duration in seconds (caps exponential growth)",
+    )
+    x_rate_limit_state_path: str = Field(
+        "data/x_ratelimit_state.json",
+        description="Path to the JSON file that persists X rate-limit state across restarts",
+    )
+
     # -- External call defaults -----------------------------------------------
     external_api_timeout_seconds: float = Field(
         10.0, gt=0, description="Default timeout for external API calls"
@@ -353,6 +563,20 @@ class Settings(BaseModel):
     )
     max_expected_sources: int = Field(
         5, gt=0, description="Normalizer for source_count_score in confidence calculation"
+    )
+
+    # -- Retention / pruning --------------------------------------------------
+    chain_snapshot_retention_hours: int = Field(
+        48, gt=0, description="Hours before old chain snapshots are pruned"
+    )
+    scored_token_retention_hours: int = Field(
+        72, gt=0, description="Hours before old scored_token records are pruned"
+    )
+    retired_alert_retention_hours: int = Field(
+        168, gt=0, description="Hours before retired/expired alerts are purged (7 days)"
+    )
+    alert_history_max_entries: int = Field(
+        50, gt=0, description="Max lifecycle history entries retained per alert"
     )
 
     # -- Scoring weights ------------------------------------------------------
@@ -369,6 +593,11 @@ class Settings(BaseModel):
     # -- Correlation / OG resolution -------------------------------------------
     og_resolution: OGResolutionConfig = Field(default_factory=OGResolutionConfig)
     correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
+
+    # -- Narrative intelligence ------------------------------------------------
+    narrative_intelligence: NarrativeIntelligenceConfig = Field(
+        default_factory=NarrativeIntelligenceConfig
+    )
 
     # -- Alert classification -------------------------------------------------
     alert_thresholds: AlertThresholds = Field(default_factory=AlertThresholds)
@@ -399,11 +628,29 @@ class Settings(BaseModel):
         env = os.environ
 
         return cls(
+            environment=env.get("ENVIRONMENT", cls.model_fields["environment"].default),
             solana_rpc_url=env.get(
                 "SOLANA_RPC_URL", cls.model_fields["solana_rpc_url"].default
             ),
             pumpfun_api_url=env.get(
                 "PUMPFUN_API_URL", cls.model_fields["pumpfun_api_url"].default
+            ),
+            dashboard_host=env.get(
+                "DASHBOARD_HOST", cls.model_fields["dashboard_host"].default
+            ),
+            dashboard_port=int(
+                env.get("DASHBOARD_PORT", cls.model_fields["dashboard_port"].default)
+            ),
+            pumpportal_ws_enabled=env.get("PUMPPORTAL_WS_ENABLED", "false").lower()
+                in ("1", "true", "yes"),
+            pumpportal_ws_url=env.get(
+                "PUMPPORTAL_WS_URL", cls.model_fields["pumpportal_ws_url"].default
+            ),
+            pumpportal_ws_stale_timeout_seconds=float(
+                env.get(
+                    "PUMPPORTAL_WS_STALE_TIMEOUT_SECONDS",
+                    cls.model_fields["pumpportal_ws_stale_timeout_seconds"].default,
+                )
             ),
             newsapi_key=env.get("NEWSAPI_KEY", cls.model_fields["newsapi_key"].default),
             serpapi_key=env.get("SERPAPI_KEY", cls.model_fields["serpapi_key"].default),
@@ -415,6 +662,10 @@ class Settings(BaseModel):
             ),
             telegram_chat_id=env.get(
                 "TELEGRAM_CHAT_ID", cls.model_fields["telegram_chat_id"].default
+            ),
+            webhook_url=env.get("WEBHOOK_URL", cls.model_fields["webhook_url"].default),
+            webhook_secret=env.get(
+                "WEBHOOK_SECRET", cls.model_fields["webhook_secret"].default
             ),
             database_path=env.get(
                 "DATABASE_PATH", cls.model_fields["database_path"].default
@@ -449,6 +700,101 @@ class Settings(BaseModel):
                 env.get(
                     "CONFIDENCE_FLOOR_FOR_ALERT",
                     cls.model_fields["confidence_floor_for_alert"].default,
+                )
+            ),
+            news_signal_strength=float(
+                env.get(
+                    "NEWS_SIGNAL_STRENGTH",
+                    cls.model_fields["news_signal_strength"].default,
+                )
+            ),
+            trends_signal_strength=float(
+                env.get(
+                    "TRENDS_SIGNAL_STRENGTH",
+                    cls.model_fields["trends_signal_strength"].default,
+                )
+            ),
+            trends_geo=env.get("TRENDS_GEO", cls.model_fields["trends_geo"].default),
+            pumpfun_fetch_limit=int(
+                env.get(
+                    "PUMPFUN_FETCH_LIMIT",
+                    cls.model_fields["pumpfun_fetch_limit"].default,
+                )
+            ),
+            news_page_size=int(
+                env.get("NEWS_PAGE_SIZE", cls.model_fields["news_page_size"].default)
+            ),
+            chain_snapshot_retention_hours=int(
+                env.get(
+                    "CHAIN_SNAPSHOT_RETENTION_HOURS",
+                    cls.model_fields["chain_snapshot_retention_hours"].default,
+                )
+            ),
+            scored_token_retention_hours=int(
+                env.get(
+                    "SCORED_TOKEN_RETENTION_HOURS",
+                    cls.model_fields["scored_token_retention_hours"].default,
+                )
+            ),
+            retired_alert_retention_hours=int(
+                env.get(
+                    "RETIRED_ALERT_RETENTION_HOURS",
+                    cls.model_fields["retired_alert_retention_hours"].default,
+                )
+            ),
+            alert_history_max_entries=int(
+                env.get(
+                    "ALERT_HISTORY_MAX_ENTRIES",
+                    cls.model_fields["alert_history_max_entries"].default,
+                )
+            ),
+            newsapi_rate_limit_state_path=env.get(
+                "NEWSAPI_RATE_LIMIT_STATE_PATH",
+                cls.model_fields["newsapi_rate_limit_state_path"].default,
+            ),
+            x_api_bearer_token=env.get(
+                "X_API_BEARER_TOKEN",
+                cls.model_fields["x_api_bearer_token"].default,
+            ),
+            x_enabled=env.get("X_ENABLED", "false").lower() in ("1", "true", "yes"),
+            x_queries_per_cycle=int(
+                env.get(
+                    "X_QUERIES_PER_CYCLE",
+                    cls.model_fields["x_queries_per_cycle"].default,
+                )
+            ),
+            x_max_requests_per_cycle=int(
+                env.get(
+                    "X_MAX_REQUESTS_PER_CYCLE",
+                    cls.model_fields["x_max_requests_per_cycle"].default,
+                )
+            ),
+            x_signal_strength=float(
+                env.get(
+                    "X_SIGNAL_STRENGTH",
+                    cls.model_fields["x_signal_strength"].default,
+                )
+            ),
+            x_rate_limit_state_path=env.get(
+                "X_RATE_LIMIT_STATE_PATH",
+                cls.model_fields["x_rate_limit_state_path"].default,
+            ),
+            x_cooldown_after=int(
+                env.get(
+                    "X_COOLDOWN_AFTER",
+                    cls.model_fields["x_cooldown_after"].default,
+                )
+            ),
+            x_cooldown_seconds=float(
+                env.get(
+                    "X_COOLDOWN_SECONDS",
+                    cls.model_fields["x_cooldown_seconds"].default,
+                )
+            ),
+            x_max_cooldown_seconds=float(
+                env.get(
+                    "X_MAX_COOLDOWN_SECONDS",
+                    cls.model_fields["x_max_cooldown_seconds"].default,
                 )
             ),
         )

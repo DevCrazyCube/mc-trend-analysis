@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  mctrend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mc-trend-analysis:latest
+    container_name: mctrend
+    restart: unless-stopped
+
+    # Mount .env file — copy from .env.prod.example and fill in real keys
+    env_file:
+      - .env
+
+    volumes:
+      # Persistent database storage — survives container restarts
+      - mctrend_data:/data
+
+    # Override CMD for specific modes:
+    #   Continuous (default):  no override
+    #   Single cycle:          command: ["--once"]
+    #   Demo:                  command: ["--demo", "--once"]
+    #   Status check:          command: ["--status"]
+
+    healthcheck:
+      test: ["CMD", "python", "-m", "mctrend.runner", "--status", "--env", "/dev/null"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  mctrend_data:
+    driver: local

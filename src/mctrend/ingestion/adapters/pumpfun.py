@@ -1,15 +1,37 @@
 """Pump.fun token ingestion adapter. Fetches newly launched tokens."""
 import httpx
 from datetime import datetime, timezone
-from .base import SourceAdapter, logger
+from .base import SourceAdapter, logger, retry_fetch
+
 
 class PumpFunAdapter(SourceAdapter):
-    """Fetches new token launches from Pump.fun API."""
+    """Fetches new token launches from a Pump.fun-compatible token listing API.
 
-    def __init__(self, api_url: str | None = None, timeout: float = 10.0):
+    NOTE: The default public endpoint (``frontend-api-v2.pump.fun``) is
+    non-functional — it returns 503 persistently (not intermittently).  This
+    adapter is **only registered** when ``PUMPFUN_API_URL`` is explicitly set
+    to a working token listing REST API.
+
+    The configured URL must serve a JSON array of token objects at
+    ``<URL>/coins``.  It must be a token *listing* endpoint — not a trade
+    execution endpoint (e.g. ``pumpportal.fun/api/trade`` returns 403 and is
+    categorically wrong for this use case).
+    """
+
+    SUPPORTED = True
+    RELIABILITY_NOTE = (
+        "Default public endpoint (frontend-api-v2.pump.fun) is non-functional "
+        "(persistent 503). This adapter is only registered when PUMPFUN_API_URL "
+        "is explicitly set to a working token listing REST API. "
+        "The URL must serve a JSON array at <URL>/coins."
+    )
+
+    def __init__(self, api_url: str | None = None, timeout: float = 10.0,
+                 fetch_limit: int = 50):
         super().__init__(source_name="pump.fun", source_type="token_launch_platform")
         self.api_url = api_url or "https://frontend-api-v2.pump.fun"
         self.timeout = timeout
+        self.fetch_limit = fetch_limit
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -18,19 +40,21 @@ class PumpFunAdapter(SourceAdapter):
         return self._client
 
     async def fetch(self) -> list[dict]:
-        """Fetch recent token launches. Returns normalized dicts."""
-        try:
+        """Fetch recent token launches with retry. Returns normalized dicts."""
+        async def _do_fetch():
             client = await self._get_client()
-            # Try to get recent tokens from the coins endpoint
             response = await client.get(
                 f"{self.api_url}/coins",
-                params={"offset": 0, "limit": 50, "sort": "creation_time", "order": "DESC",
-                         "includeNsfw": "false"},
-                headers={"Accept": "application/json"}
+                params={"offset": 0, "limit": self.fetch_limit,
+                        "sort": "creation_time", "order": "DESC",
+                        "includeNsfw": "false"},
+                headers={"Accept": "application/json"},
             )
             response.raise_for_status()
-            data = response.json()
+            return response.json()
 
+        try:
+            data = await retry_fetch(_do_fetch, self.source_name)
             self._mark_healthy()
 
             tokens = []

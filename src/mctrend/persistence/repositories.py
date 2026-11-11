@@ -22,6 +22,7 @@ _JSON_COLUMNS: set[str] = {
     "reasoning",
     "re_eval_triggers",
     "history",
+    "rejection_reasons",
 }
 
 
@@ -114,6 +115,17 @@ class TokenRepository:
         )
         return _deserialize_rows(cursor.fetchall())
 
+    def get_recent(self, hours: float = 8.0, limit: int = 500) -> list[dict]:
+        """Return tokens created within the last *hours* hours."""
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        cursor = self.db.connection.execute(
+            "SELECT * FROM tokens WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+            (cutoff, limit),
+        )
+        return _deserialize_rows(cursor.fetchall())
+
     def update_status(self, token_id: str, new_status: str, reason: str) -> None:
         """Update a token's status and log the transition reason in updated_at."""
         from datetime import datetime, timezone
@@ -138,6 +150,27 @@ class TokenRepository:
         )
         return _deserialize_row(cursor.fetchone())
 
+    def prune_old_snapshots(self, older_than: str) -> int:
+        """Delete chain snapshots older than *older_than* ISO timestamp.
+
+        Retains the most recent snapshot per token regardless of age.
+        Returns the number of rows deleted.
+        """
+        cursor = self.db.connection.execute(
+            """
+            DELETE FROM chain_snapshots
+            WHERE sampled_at < ?
+              AND snapshot_id NOT IN (
+                  SELECT snapshot_id FROM chain_snapshots cs2
+                  WHERE cs2.token_id = chain_snapshots.token_id
+                  ORDER BY sampled_at DESC LIMIT 1
+              )
+            """,
+            (older_than,),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount
+
 
 # ---------------------------------------------------------------------------
 # NarrativeRepository
@@ -161,19 +194,47 @@ class NarrativeRepository:
         )
         return _deserialize_row(cursor.fetchone())
 
-    def get_active(self, states: list[str] | None = None) -> list[dict]:
-        """Return narratives in the given states (default: EMERGING, PEAKING)."""
+    def get_active(self, states: list[str] | None = None, limit: int = 500) -> list[dict]:
+        """Return narratives in the given states.
+
+        Default states include both legacy (PEAKING) and new lifecycle states
+        (WEAK, EMERGING, RISING, TRENDING, FADING) — everything except DEAD and MERGED.
+        """
         if states is None:
-            states = ["EMERGING", "PEAKING"]
+            states = ["WEAK", "EMERGING", "RISING", "TRENDING", "FADING", "PEAKING"]
         placeholders = ", ".join("?" for _ in states)
         cursor = self.db.connection.execute(
             f"SELECT * FROM narratives WHERE state IN ({placeholders}) "
-            "ORDER BY attention_score DESC",
-            states,
+            "ORDER BY COALESCE(narrative_strength, attention_score, 0) DESC LIMIT ?",
+            [*states, limit],
         )
         return _deserialize_rows(cursor.fetchall())
 
-    def search_by_terms(self, terms: list[str]) -> list[dict]:
+    def get_for_scoring(self, limit: int = 500) -> list[dict]:
+        """Return narratives eligible for token scoring (EMERGING, RISING, TRENDING)."""
+        states = ["EMERGING", "RISING", "TRENDING"]
+        placeholders = ", ".join("?" for _ in states)
+        cursor = self.db.connection.execute(
+            f"SELECT * FROM narratives WHERE state IN ({placeholders}) "
+            "ORDER BY COALESCE(narrative_strength, attention_score, 0) DESC LIMIT ?",
+            [*states, limit],
+        )
+        return _deserialize_rows(cursor.fetchall())
+
+    def update_fields(self, narrative_id: str, fields: dict[str, Any]) -> None:
+        """Update specific fields on a narrative record."""
+        if not fields:
+            return
+        serialized = _serialize_row(fields)
+        set_clause = ", ".join(f"{k} = ?" for k in serialized)
+        values = list(serialized.values()) + [narrative_id]
+        self.db.connection.execute(
+            f"UPDATE narratives SET {set_clause} WHERE narrative_id = ?",
+            values,
+        )
+        self.db.connection.commit()
+
+    def search_by_terms(self, terms: list[str], limit: int = 100) -> list[dict]:
         """Search narratives whose anchor_terms or related_terms contain any of *terms*."""
         conditions = []
         params: list[str] = []
@@ -183,7 +244,8 @@ class NarrativeRepository:
             params.extend([pattern, pattern])
         where_clause = " OR ".join(conditions)
         cursor = self.db.connection.execute(
-            f"SELECT * FROM narratives WHERE {where_clause}", params
+            f"SELECT * FROM narratives WHERE {where_clause} LIMIT ?",
+            [*params, limit],
         )
         return _deserialize_rows(cursor.fetchall())
 
@@ -281,6 +343,27 @@ class ScoringRepository:
         )
         return _deserialize_rows(cursor.fetchall())
 
+    def prune_old_scored_tokens(self, older_than: str) -> int:
+        """Delete scored_tokens records older than *older_than* ISO timestamp.
+
+        Retains the most recent score per link_id regardless of age.
+        Returns the number of rows deleted.
+        """
+        cursor = self.db.connection.execute(
+            """
+            DELETE FROM scored_tokens
+            WHERE scored_at < ?
+              AND score_id NOT IN (
+                  SELECT score_id FROM scored_tokens st2
+                  WHERE st2.link_id = scored_tokens.link_id
+                  ORDER BY scored_at DESC LIMIT 1
+              )
+            """,
+            (older_than,),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount
+
 
 # ---------------------------------------------------------------------------
 # AlertRepository
@@ -312,6 +395,15 @@ class AlertRepository:
         )
         return _deserialize_row(cursor.fetchone())
 
+    def get_for_token(self, token_id: str, limit: int = 20) -> list[dict]:
+        """Return all alerts for a token (active and retired), newest first."""
+        cursor = self.db.connection.execute(
+            "SELECT * FROM alerts WHERE token_id = ? "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (token_id, limit),
+        )
+        return _deserialize_rows(cursor.fetchall())
+
     def get_active(self, limit: int = 100) -> list[dict]:
         """Return all active alerts, ordered by net_potential descending."""
         cursor = self.db.connection.execute(
@@ -321,13 +413,26 @@ class AlertRepository:
         )
         return _deserialize_rows(cursor.fetchall())
 
-    def get_expired(self, now: str) -> list[dict]:
+    def get_expired(self, now: str, limit: int = 100) -> list[dict]:
         """Return active alerts whose expires_at is at or before *now*."""
         cursor = self.db.connection.execute(
-            "SELECT * FROM alerts WHERE expires_at <= ? AND status = 'ACTIVE'",
-            (now,),
+            "SELECT * FROM alerts WHERE expires_at <= ? AND status = 'ACTIVE' LIMIT ?",
+            (now, limit),
         )
         return _deserialize_rows(cursor.fetchall())
+
+    def purge_old_retired(self, older_than: str) -> int:
+        """Delete retired/expired alerts older than *older_than* ISO timestamp.
+
+        Returns the number of rows deleted.
+        """
+        cursor = self.db.connection.execute(
+            "DELETE FROM alerts WHERE status IN ('RETIRED', 'EXPIRED') "
+            "AND updated_at < ?",
+            (older_than,),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount
 
     def retire(self, alert_id: str, reason: str, retired_at: str) -> None:
         """Retire an alert with a reason and timestamp."""
@@ -366,9 +471,92 @@ class SourceGapRepository:
         )
         self.db.connection.commit()
 
+    def close_open_gaps_for_source(self, source_name: str, ended_at: str) -> int:
+        """Close all open gaps for *source_name*.
+
+        Called when an adapter successfully fetches data after a period of failures.
+        Returns the number of gaps closed.
+        """
+        cursor = self.db.connection.execute(
+            "UPDATE source_gaps SET ended_at = ? "
+            "WHERE source_name = ? AND ended_at IS NULL",
+            (ended_at, source_name),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount
+
     def get_open_gaps(self) -> list[dict]:
         """Return all source gaps that have not yet been closed."""
         cursor = self.db.connection.execute(
             "SELECT * FROM source_gaps WHERE ended_at IS NULL"
         )
         return _deserialize_rows(cursor.fetchall())
+
+
+# ---------------------------------------------------------------------------
+# RejectedCandidateRepository
+# ---------------------------------------------------------------------------
+
+
+class RejectedCandidateRepository:
+    """Persistence for scored tokens that were classified as 'ignore'.
+
+    The table uses a compound primary key (token_id, narrative_id) so that
+    only the most recent evaluation per token-narrative pair is kept.
+    INSERT OR REPLACE naturally evicts the stale row on each re-score.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def save(self, candidate: dict) -> None:
+        """Upsert a rejected candidate (INSERT OR REPLACE by token_id+narrative_id)."""
+        cols = [
+            "token_id", "narrative_id", "token_name", "token_symbol",
+            "narrative_name", "score_id", "alert_type",
+            "net_potential", "p_potential", "p_failure", "confidence_score",
+            "watch_gap", "rejection_reasons", "dimension_scores",
+            "risk_flags", "data_gaps", "rejected_at",
+        ]
+        values = []
+        for col in cols:
+            val = candidate.get(col)
+            if col in _JSON_COLUMNS and val is not None and not isinstance(val, str):
+                val = json.dumps(val)
+            values.append(val)
+
+        placeholders = ", ".join("?" for _ in cols)
+        col_names = ", ".join(cols)
+        self.db.connection.execute(
+            f"INSERT OR REPLACE INTO rejected_candidates ({col_names}) VALUES ({placeholders})",
+            values,
+        )
+        self.db.connection.commit()
+
+    def get_top_by_watch_gap(self, limit: int = 100) -> list[dict]:
+        """Return candidates sorted by watch_gap ascending (closest to alert first).
+
+        Only returns candidates where watch_gap >= 0 (i.e., truly below watch
+        threshold).  Candidates above the watch threshold have been promoted to
+        alerts and are excluded.
+        """
+        cursor = self.db.connection.execute(
+            "SELECT * FROM rejected_candidates "
+            "WHERE watch_gap >= 0 "
+            "ORDER BY watch_gap ASC, net_potential DESC "
+            "LIMIT ?",
+            (limit,),
+        )
+        return _deserialize_rows(cursor.fetchall())
+
+    def prune_old(self, older_than: str) -> int:
+        """Delete rejected candidates last evaluated before *older_than* ISO timestamp.
+
+        Returns the number of rows deleted.
+        """
+        cursor = self.db.connection.execute(
+            "DELETE FROM rejected_candidates WHERE rejected_at < ?",
+            (older_than,),
+        )
+        self.db.connection.commit()
+        return cursor.rowcount

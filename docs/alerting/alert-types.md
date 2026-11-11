@@ -29,7 +29,7 @@ The system produces eight distinct alert types, ordered from most to least oppor
 - `net_potential` ≥ 0.60
 - `P_failure` < 0.30
 - `confidence_score` ≥ 0.65
-- Narrative state: EMERGING or PEAKING (not DECLINING)
+- Narrative state: EMERGING, RISING or TRENDING (not FADING)
 - No critical risk flags present
 
 **Meaning:** The best convergence of positive signals this system can identify. Multiple strong dimensions agree. Failure risk is low by observed signals. This is still not a guarantee.
@@ -46,7 +46,7 @@ The system produces eight distinct alert types, ordered from most to least oppor
 - `net_potential` ≥ 0.45
 - `P_failure` < 0.50
 - `confidence_score` ≥ 0.55
-- Narrative state: EMERGING or PEAKING
+- Narrative state: EMERGING, RISING or TRENDING
 - May have medium risk flags but not critical
 
 **Meaning:** Strong opportunity signal with notable risk present. Worth close attention and further verification before acting.
@@ -62,7 +62,7 @@ The system produces eight distinct alert types, ordered from most to least oppor
 **Criteria:**
 - Token previously had `possible-entry` or `high-potential-watch` alert
 - `net_potential` still ≥ 0.35
-- Narrative state: PEAKING or early DECLINING
+- Narrative state: TRENDING or early FADING
 - Timing quality has decreased since initial alert (lifecycle progressing)
 
 **Meaning:** The opportunity that was identified is maturing. The window may be narrowing. Relevant for someone who acted on an earlier alert.

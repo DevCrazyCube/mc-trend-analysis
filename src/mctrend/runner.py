@@ -5,7 +5,9 @@ Usage:
     python -m mctrend.runner              # Run continuous polling loop
     python -m mctrend.runner --once       # Run single cycle and exit
     python -m mctrend.runner --status     # Show system status and exit
-    python -m mctrend.runner --demo       # Run with synthetic demo data
+    python -m mctrend.runner --demo       # One cycle on synthetic demo data
+    python -m mctrend.runner --dashboard  # Continuous loop plus the dashboard
+    python -m mctrend.runner --demo --dashboard   # Dashboard on demo data, no keys
 """
 
 import argparse
@@ -13,6 +15,7 @@ import asyncio
 import os
 import signal
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,10 +27,14 @@ from mctrend.correlation.linker import CorrelationEngine
 from mctrend.delivery.channels import ConsoleChannel, DeliveryRouter, TelegramChannel
 from mctrend.ingestion.adapters.news import NewsAPIAdapter
 from mctrend.ingestion.adapters.pumpfun import PumpFunAdapter
+from mctrend.ingestion.adapters.pumpportal_ws import PumpPortalWebSocketAdapter
+from mctrend.ingestion.adapters.solana_rpc import SolanaRPCAdapter
 from mctrend.ingestion.adapters.trends import SerpAPITrendsAdapter
+from mctrend.ingestion.adapters.x_api import XAPIAdapter
 from mctrend.ingestion.manager import IngestionManager
-from mctrend.normalization.normalizer import normalize_event, normalize_token
-from mctrend.persistence.database import Database
+from mctrend.ingestion.manager import IngestionManager
+from mctrend.normalization.normalizer import merge_narratives, normalize_event, normalize_token
+from mctrend.persistence.database import Database, SchemaVersionError
 from mctrend.persistence.repositories import (
     AlertRepository,
     NarrativeRepository,
@@ -40,9 +47,173 @@ from mctrend.utils.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
 
+_VALID_ENVIRONMENTS = {"demo", "dev", "prod"}
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
-def build_system(settings: Settings) -> tuple:
-    """Build all system components from settings. Returns (pipeline, db)."""
+
+# ---------------------------------------------------------------------------
+# Startup validation (D-1, D-2)
+# ---------------------------------------------------------------------------
+
+
+def _source_status_map(settings: Settings, demo_mode: bool) -> dict[str, str]:
+    """Return a mapping of source name → status label.
+
+    Labels:
+      demo-disabled   — live adapter suppressed because --demo mode is active
+      enabled         — adapter will be registered and will attempt fetches
+      unsupported     — adapter code exists but upstream API is non-functional
+      disabled        — no API key / config provided
+    """
+    status: dict[str, str] = {}
+
+    if demo_mode:
+        status["pump.fun"] = "demo-disabled"
+        status["pumpportal_ws"] = "demo-disabled"
+        status["solana_rpc"] = "demo-disabled"
+        status["newsapi"] = "demo-disabled"
+        status["serpapi_trends"] = "demo-disabled"
+        status["x"] = "demo-disabled"
+    else:
+        # pumpportal_ws — primary discovery path
+        if settings.pumpportal_ws_enabled:
+            status["pumpportal_ws"] = "enabled (WebSocket real-time discovery)"
+        else:
+            status["pumpportal_ws"] = (
+                "disabled (set PUMPPORTAL_WS_ENABLED=true to enable real-time discovery)"
+            )
+        # pump.fun REST — disabled when WS is active; only registered when WS is off
+        if settings.pumpportal_ws_enabled:
+            status["pump.fun"] = (
+                "disabled (WebSocket discovery is primary; REST adapter not registered)"
+            )
+        elif settings.pumpfun_api_url:
+            status["pump.fun"] = "enabled-unreliable"
+        else:
+            status["pump.fun"] = (
+                "unsupported (default endpoint non-functional — "
+                "set PUMPFUN_API_URL to a token listing REST API)"
+            )
+        # solana_rpc — enabled (public RPC, rate-limited but usable)
+        status["solana_rpc"] = "enabled"
+        # newsapi
+        status["newsapi"] = "enabled" if settings.newsapi_key else "disabled (NEWSAPI_KEY not set)"
+        # serpapi_trends — API discontinued regardless of key
+        status["serpapi_trends"] = "unsupported (SerpAPI endpoint discontinued)"
+        # X (Twitter)
+        if settings.x_enabled and settings.x_api_bearer_token:
+            status["x"] = "enabled"
+        elif settings.x_enabled:
+            status["x"] = "disabled (X_ENABLED=true but X_API_BEARER_TOKEN not set)"
+        else:
+            status["x"] = "disabled (set X_ENABLED=true and X_API_BEARER_TOKEN)"
+
+    # Delivery channels
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        status["telegram_delivery"] = "enabled"
+    else:
+        status["telegram_delivery"] = "disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set)"
+
+    if settings.webhook_url:
+        status["webhook_delivery"] = "enabled"
+
+    return status
+
+
+def validate_startup(settings: Settings, demo_mode: bool = False) -> list[str]:
+    """Validate settings and system preconditions before startup.
+
+    Returns a list of error strings. An empty list means all checks passed.
+    Failures are printed with clear messages so operators can fix them quickly.
+    """
+    errors: list[str] = []
+
+    # Environment
+    if settings.environment not in _VALID_ENVIRONMENTS:
+        errors.append(
+            f"ENVIRONMENT={settings.environment!r} is not valid. "
+            f"Must be one of: {sorted(_VALID_ENVIRONMENTS)}"
+        )
+
+    # Dashboard auth safety in production
+    if settings.environment == "prod":
+        dashboard_api_key = os.environ.get("DASHBOARD_API_KEY", "").strip()
+        if not dashboard_api_key:
+            errors.append(
+                "DASHBOARD_API_KEY is not set, but ENVIRONMENT=prod. "
+                "In production, the dashboard API MUST be protected by a strong API key. "
+                "Set DASHBOARD_API_KEY to a secure random value (e.g., 32+ char, alphanumeric+symbols). "
+                "Without this, the dashboard will be publicly accessible and anyone can read/modify system config."
+            )
+
+    # Log level
+    if settings.log_level.upper() not in _VALID_LOG_LEVELS:
+        errors.append(
+            f"LOG_LEVEL={settings.log_level!r} is not valid. "
+            f"Must be one of: {sorted(_VALID_LOG_LEVELS)}"
+        )
+
+    # Database path writable
+    db_path = Path(settings.database_path)
+    db_dir = db_path.parent if db_path.parent != Path(".") else Path(".")
+    if db_dir != Path(".") and not db_dir.exists():
+        try:
+            db_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            errors.append(
+                f"Cannot create database directory {db_dir}: {e}. "
+                "Ensure the directory is writable."
+            )
+    elif db_path.exists() and not os.access(db_path, os.W_OK):
+        errors.append(
+            f"Database file {db_path} is not writable. "
+            "Check file permissions."
+        )
+
+    source_status = _source_status_map(settings, demo_mode)
+    logger.info(
+        "startup_source_check",
+        environment=settings.environment,
+        demo_mode=demo_mode,
+        source_status=source_status,
+    )
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# System builder
+# ---------------------------------------------------------------------------
+
+
+async def _run_startup_preflight(ingestion: IngestionManager) -> None:
+    """Run auth preflight checks on event adapters and log results.
+
+    Informational only — a failed check does NOT abort startup.  The goal is
+    to surface credential/configuration problems before the first cycle so the
+    operator can fix them immediately rather than after many failed cycles.
+    """
+    results = await ingestion.run_preflight_checks()
+    for source, (ok, reason) in results.items():
+        if ok:
+            logger.info("startup_source_auth_ok", source=source, reason=reason)
+        else:
+            logger.warning(
+                "startup_source_auth_failed",
+                source=source,
+                authorized=False,
+                reason=reason,
+                hint=f"Narrative signals from '{source}' will be unavailable until the credential is fixed.",
+            )
+
+
+def build_system(settings: Settings, demo_mode: bool = False) -> tuple:
+    """Build all system components from settings. Returns (pipeline, db).
+
+    When *demo_mode* is True, no live external adapters are registered.
+    Ingestion is a no-op — the pipeline runs only on data injected by
+    ``inject_demo_data()``.  No HTTP calls are made during the cycle.
+    """
     # Database
     db_path = settings.database_path
     os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
@@ -52,27 +223,112 @@ def build_system(settings: Settings) -> tuple:
     # Ingestion
     ingestion = IngestionManager()
 
-    if settings.pumpfun_api_url:
-        ingestion.register_token_adapter(
-            PumpFunAdapter(api_url=settings.pumpfun_api_url,
-                           timeout=settings.external_api_timeout_seconds)
-        )
+    ws_adapter: PumpPortalWebSocketAdapter | None = None
+
+    if demo_mode:
+        # Demo mode: no live adapters registered → zero external HTTP calls.
+        # All data comes from inject_demo_data() called before run_cycle().
+        logger.info("demo_mode_no_live_adapters")
     else:
+        # Live adapters — register in order of reliability.
+
+        # PumpPortal WebSocket: primary real-time discovery path.
+        if settings.pumpportal_ws_enabled:
+            ws_adapter = PumpPortalWebSocketAdapter(
+                ws_url=settings.pumpportal_ws_url,
+                stale_timeout_seconds=settings.pumpportal_ws_stale_timeout_seconds,
+            )
+            ingestion.register_token_adapter(ws_adapter)
+            logger.info(
+                "pumpportal_ws_adapter_registered",
+                url=settings.pumpportal_ws_url,
+            )
+        else:
+            logger.info(
+                "pumpportal_ws_disabled",
+                hint="Set PUMPPORTAL_WS_ENABLED=true to enable real-time token discovery",
+            )
+
+        # Pump.fun REST: disabled when WebSocket discovery is active.
+        # When PUMPPORTAL_WS_ENABLED=true, WebSocket is the primary discovery path.
+        # Registering the REST adapter alongside it would produce 403 noise
+        # since the public pumpportal.fun REST endpoint is non-functional.
+        if settings.pumpfun_api_url and not settings.pumpportal_ws_enabled:
+            ingestion.register_token_adapter(
+                PumpFunAdapter(
+                    api_url=settings.pumpfun_api_url,
+                    timeout=settings.external_api_timeout_seconds,
+                    fetch_limit=settings.pumpfun_fetch_limit,
+                )
+            )
+        elif settings.pumpfun_api_url and settings.pumpportal_ws_enabled:
+            logger.info(
+                "pumpfun_rest_skipped_ws_active",
+                reason="WebSocket discovery is enabled; REST token adapter not registered.",
+            )
+        elif not settings.pumpportal_ws_enabled:
+            # Neither WS nor REST discovery is configured
+            logger.warning(
+                "live_token_discovery_unavailable",
+                reason=(
+                    "No token discovery source configured. "
+                    "Set PUMPPORTAL_WS_ENABLED=true for real-time WebSocket discovery, "
+                    "or PUMPFUN_API_URL to a working token listing REST API."
+                ),
+            )
+
+        # SolanaRPC — for on-chain enrichment; public endpoint, rate-limited.
         ingestion.register_token_adapter(
-            PumpFunAdapter(timeout=settings.external_api_timeout_seconds)
+            SolanaRPCAdapter(
+                rpc_url=settings.solana_rpc_url,
+                timeout=settings.external_api_timeout_seconds,
+            )
         )
 
-    if settings.newsapi_key:
-        ingestion.register_event_adapter(
-            NewsAPIAdapter(api_key=settings.newsapi_key,
-                           timeout=settings.external_api_timeout_seconds)
-        )
+        if settings.newsapi_key:
+            ingestion.register_event_adapter(
+                NewsAPIAdapter(
+                    api_key=settings.newsapi_key,
+                    timeout=settings.external_api_timeout_seconds,
+                    query_terms=settings.news_query_terms,
+                    page_size=settings.news_page_size,
+                    signal_strength=settings.news_signal_strength,
+                    domains=settings.newsapi_domains,
+                    cooldown_after=settings.newsapi_rate_limit_cooldown_after,
+                    cooldown_seconds=settings.newsapi_rate_limit_cooldown_seconds,
+                    max_cooldown_seconds=settings.newsapi_rate_limit_max_cooldown_seconds,
+                    state_path=settings.newsapi_rate_limit_state_path or None,
+                )
+            )
 
-    if settings.serpapi_key:
-        ingestion.register_event_adapter(
-            SerpAPITrendsAdapter(api_key=settings.serpapi_key,
-                                 timeout=settings.external_api_timeout_seconds)
-        )
+        # X (Twitter): register as event adapter when enabled + token set.
+        if settings.x_enabled and settings.x_api_bearer_token:
+            ingestion.register_event_adapter(
+                XAPIAdapter(
+                    bearer_token=settings.x_api_bearer_token,
+                    timeout=settings.external_api_timeout_seconds,
+                    queries_per_cycle=settings.x_queries_per_cycle,
+                    max_requests_per_cycle=settings.x_max_requests_per_cycle,
+                    signal_strength=settings.x_signal_strength,
+                    cooldown_after=settings.x_cooldown_after,
+                    cooldown_seconds=settings.x_cooldown_seconds,
+                    max_cooldown_seconds=settings.x_max_cooldown_seconds,
+                    state_path=settings.x_rate_limit_state_path or None,
+                )
+            )
+        elif settings.x_enabled:
+            logger.warning(
+                "x_adapter_not_registered",
+                reason="X_ENABLED=true but X_API_BEARER_TOKEN is not set",
+            )
+
+        # SerpAPI trends: adapter is marked SUPPORTED=False (API discontinued).
+        # Do not register regardless of whether a key is set.
+        if settings.serpapi_key:
+            logger.warning(
+                "serpapi_key_set_but_adapter_unsupported",
+                reason=SerpAPITrendsAdapter.UNSUPPORTED_REASON,
+            )
 
     # Correlation
     correlator = CorrelationEngine(
@@ -84,7 +340,10 @@ def build_system(settings: Settings) -> tuple:
 
     # Alert engine
     alert_repo = AlertRepository(db)
-    alert_engine = AlertEngine(alert_repo=alert_repo)
+    alert_engine = AlertEngine(
+        alert_repo=alert_repo,
+        history_max_entries=settings.alert_history_max_entries,
+    )
 
     # Delivery
     delivery = DeliveryRouter(rate_limit_per_10min=settings.alert_rate_limit_per_10min)
@@ -107,9 +366,15 @@ def build_system(settings: Settings) -> tuple:
         scorer=scorer,
         alert_engine=alert_engine,
         delivery=delivery,
+        settings=settings,
     )
 
-    return pipeline, db
+    return pipeline, db, ws_adapter
+
+
+# ---------------------------------------------------------------------------
+# Demo data injection
+# ---------------------------------------------------------------------------
 
 
 def inject_demo_data(pipeline: Pipeline):
@@ -118,33 +383,83 @@ def inject_demo_data(pipeline: Pipeline):
 
     logger.info("injecting_demo_data")
 
-    # Create some narratives
+    # Create some crypto-relevant narratives that will pass the relevance gate.
+    # These represent realistic memecoin/market scenarios on Pump.fun / Solana.
     narratives = [
         {
-            "anchor_terms": ["DEEPMIND", "GOOGLE", "AI"],
-            "related_terms": ["GEMINI", "ARTIFICIAL", "INTELLIGENCE"],
-            "description": "Google DeepMind announces major AI breakthrough",
+            "anchor_terms": ["SOLANA", "MEMECOIN", "PUMP"],
+            "related_terms": ["TOKEN", "LAUNCH", "DEGEN", "LIQUIDITY"],
+            "description": "Solana memecoin pump.fun token launch surge",
             "source_type": "news",
             "source_name": "demo_news",
             "signal_strength": 0.85,
             "published_at": now.isoformat(),
         },
         {
-            "anchor_terms": ["MOONDOG", "SPACE", "DOG"],
-            "related_terms": ["BALLOON", "NASA", "VIRAL"],
-            "description": "Viral video of dog in space balloon experiment",
+            "anchor_terms": ["MOONDOG", "TOKEN", "SOLANA"],
+            "related_terms": ["MEMECOIN", "HOLDER", "WALLET", "DEGEN"],
+            "description": "MOONDOG token gaining traction on Solana with growing holder count",
             "source_type": "search_trends",
             "source_name": "demo_trends",
             "signal_strength": 0.78,
             "published_at": now.isoformat(),
         },
         {
-            "anchor_terms": ["BRAVADO", "BOXING", "CHAMPION"],
-            "related_terms": ["FIGHT", "KNOCKOUT", "VIRAL"],
-            "description": "Boxing championship viral victory moment",
+            "anchor_terms": ["BRAVADO", "CRYPTO", "TOKEN"],
+            "related_terms": ["PUMP", "MEMECOIN", "SOLANA", "MARKET"],
+            "description": "BRAVADO crypto token trending on pump.fun",
             "source_type": "news",
             "source_name": "demo_news",
             "signal_strength": 0.72,
+            "published_at": now.isoformat(),
+        },
+    ]
+
+    # Additional source confirmations — multiple sources with diverse types
+    # needed to reach RISING state (accelerating velocity + strength >= 0.35).
+    confirmations = [
+        # Second sources
+        {
+            "anchor_terms": ["SOLANA", "MEMECOIN", "PUMP"],
+            "source_type": "search_trends",
+            "source_name": "demo_trends",
+            "signal_strength": 0.80,
+            "published_at": now.isoformat(),
+        },
+        {
+            "anchor_terms": ["MOONDOG", "TOKEN", "SOLANA"],
+            "source_type": "news",
+            "source_name": "demo_news",
+            "signal_strength": 0.75,
+            "published_at": now.isoformat(),
+        },
+        {
+            "anchor_terms": ["BRAVADO", "CRYPTO", "TOKEN"],
+            "source_type": "search_trends",
+            "source_name": "demo_trends",
+            "signal_strength": 0.70,
+            "published_at": now.isoformat(),
+        },
+        # Third sources (different type for diversity boost)
+        {
+            "anchor_terms": ["SOLANA", "MEMECOIN", "PUMP"],
+            "source_type": "twitter",
+            "source_name": "demo_twitter",
+            "signal_strength": 0.82,
+            "published_at": now.isoformat(),
+        },
+        {
+            "anchor_terms": ["MOONDOG", "TOKEN", "SOLANA"],
+            "source_type": "twitter",
+            "source_name": "demo_twitter",
+            "signal_strength": 0.77,
+            "published_at": now.isoformat(),
+        },
+        {
+            "anchor_terms": ["BRAVADO", "CRYPTO", "TOKEN"],
+            "source_type": "twitter",
+            "source_name": "demo_twitter",
+            "signal_strength": 0.68,
             "published_at": now.isoformat(),
         },
     ]
@@ -154,13 +469,37 @@ def inject_demo_data(pipeline: Pipeline):
         if normalized:
             pipeline.narrative_repo.save(normalized)
 
+    # Merge additional sources into existing narratives
+    for conf in confirmations:
+        existing = pipeline._find_matching_narrative(
+            [t.strip().upper() for t in conf["anchor_terms"]]
+        )
+        if existing:
+            merged = merge_narratives(existing, conf)
+            pipeline.narrative_repo.save(merged)
+
+    # Run narrative intelligence evaluation twice:
+    # Pass 1: establishes baseline velocity (velocity_delta=0 → EMERGING)
+    # Pass 2: sees acceleration from previous velocity → can reach RISING
+    from mctrend.narrative.intelligence import NarrativeConfig, NarrativeIntelligence
+
+    ni = getattr(pipeline, "narrative_intel", NarrativeIntelligence(NarrativeConfig()))
+    for _pass in range(2):
+        all_narrs = pipeline.narrative_repo.get_active()
+        for narr in all_narrs:
+            updates = ni.transition_narrative(narr, now)
+            if updates:
+                pipeline.narrative_repo.update_fields(narr["narrative_id"], updates)
+                # Re-read to get updated fields for next iteration
+                narr.update(updates)
+
     # Create tokens that match these narratives
     tokens = [
         {
             "address": "DEMO1111111111111111111111111111111111111111",
-            "name": "DEEPMIND",
-            "symbol": "DEEPMIND",
-            "description": "The original DeepMind token",
+            "name": "SOLPUMP",
+            "symbol": "SOLPUMP",
+            "description": "The original Solana pump token",
             "deployed_by": "DemoDeployer1111111111111111111111111111111",
             "launch_time": (now - timedelta(minutes=8)).isoformat(),
             "launch_platform": "pump.fun",
@@ -170,9 +509,9 @@ def inject_demo_data(pipeline: Pipeline):
         },
         {
             "address": "DEMO2222222222222222222222222222222222222222",
-            "name": "DMIND",
-            "symbol": "DMIND",
-            "description": "DeepMind copycat",
+            "name": "SOLMEME",
+            "symbol": "SOLMEME",
+            "description": "Solana memecoin copycat",
             "deployed_by": "DemoDeployer2222222222222222222222222222222",
             "launch_time": (now - timedelta(minutes=3)).isoformat(),
             "launch_platform": "pump.fun",
@@ -184,7 +523,7 @@ def inject_demo_data(pipeline: Pipeline):
             "address": "DEMO3333333333333333333333333333333333333333",
             "name": "MOONDOG",
             "symbol": "MOONDOG",
-            "description": "To the moon, dog!",
+            "description": "MOONDOG Solana token",
             "deployed_by": "DemoDeployer3333333333333333333333333333333",
             "launch_time": (now - timedelta(minutes=11)).isoformat(),
             "launch_platform": "pump.fun",
@@ -196,7 +535,7 @@ def inject_demo_data(pipeline: Pipeline):
             "address": "DEMO4444444444444444444444444444444444444444",
             "name": "BRAVADO",
             "symbol": "BRAVADO",
-            "description": "Victory moment token",
+            "description": "BRAVADO crypto token",
             "deployed_by": "BadDeployer444444444444444444444444444444444",
             "launch_time": (now - timedelta(minutes=5)).isoformat(),
             "launch_platform": "pump.fun",
@@ -212,11 +551,10 @@ def inject_demo_data(pipeline: Pipeline):
             pipeline.token_repo.save(normalized)
 
     # Add some chain snapshots with varied risk profiles
-    from mctrend.normalization.normalizer import normalize_chain_snapshot
     import uuid
 
     snapshots = [
-        {  # DEEPMIND - moderate risk
+        {  # SOLPUMP - moderate risk
             "token_id_lookup": "DEMO1111111111111111111111111111111111111111",
             "holder_count": 47,
             "top_5_holder_pct": 0.41,
@@ -275,9 +613,27 @@ def inject_demo_data(pipeline: Pipeline):
     logger.info("demo_data_injected", tokens=len(tokens), narratives=len(narratives))
 
 
+# ---------------------------------------------------------------------------
+# Execution modes
+# ---------------------------------------------------------------------------
+
+
 async def run_once(settings: Settings, demo: bool = False):
-    """Run a single processing cycle."""
-    pipeline, db = build_system(settings)
+    """Run a single processing cycle.
+
+    When *demo* is True, no live adapters are registered and only synthetic
+    data (injected by ``inject_demo_data``) is processed.
+    """
+    pipeline, db, ws_adapter = build_system(settings, demo_mode=demo)
+
+    # Start WS adapter if registered
+    if ws_adapter is not None:
+        ws_adapter.start_background_task()
+        # Brief settle time so first cycle has some events
+        await asyncio.sleep(2)
+
+    if not demo:
+        await _run_startup_preflight(pipeline.ingestion)
 
     if demo:
         inject_demo_data(pipeline)
@@ -294,15 +650,45 @@ async def run_once(settings: Settings, demo: bool = False):
     for key, value in stats.items():
         print(f"  {key}: {value}")
 
+    if ws_adapter is not None:
+        await ws_adapter.stop()
     await pipeline.ingestion.close_all()
     await pipeline.delivery.close_all()
     db.close()
 
 
-async def run_continuous(settings: Settings):
-    """Run continuous polling loop."""
-    pipeline, db = build_system(settings)
+async def run_continuous(
+    settings: Settings, dashboard: bool = False, demo: bool = False
+):
+    """Run continuous polling loop with graceful shutdown on SIGINT/SIGTERM.
 
+    When *demo* is True, no live adapters are registered: the synthetic data
+    from ``inject_demo_data`` is injected once and the loop keeps running on
+    it.  This is what ``--demo --dashboard`` uses, so the dashboard can be
+    opened without any API key.
+    """
+    from mctrend.api import deps as api_deps
+
+    pipeline, db, ws_adapter = build_system(settings, demo_mode=demo)
+
+    # Register DB and WS adapter with the API layer
+    api_deps.set_db(db)
+    api_deps.set_pipeline_start_time(time.time())
+    if ws_adapter is not None:
+        api_deps.set_ws_adapter(ws_adapter)
+
+    if demo:
+        inject_demo_data(pipeline)
+    else:
+        # Run source auth preflight checks before first cycle
+        await _run_startup_preflight(pipeline.ingestion)
+
+    # Start WebSocket adapter background task
+    if ws_adapter is not None:
+        ws_adapter.start_background_task()
+        logger.info("pumpportal_ws_started")
+
+    # Shutdown flag — set by signal handlers; cycle completes before exit
     shutdown = asyncio.Event()
 
     def handle_signal(sig, frame):
@@ -312,34 +698,88 @@ async def run_continuous(settings: Settings):
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    logger.info("pipeline_starting_continuous",
-                token_interval=settings.polling_interval_tokens,
-                event_interval=settings.polling_interval_events)
+    logger.info(
+        "pipeline_starting_continuous",
+        environment=settings.environment,
+        token_interval=settings.polling_interval_tokens,
+        event_interval=settings.polling_interval_events,
+        dashboard=dashboard,
+    )
+
+    tasks = []
+
+    # Start dashboard server if requested
+    if dashboard:
+        import uvicorn
+        from mctrend.api.app import create_app
+
+        app = create_app()
+
+        config = uvicorn.Config(
+            app,
+            host=settings.dashboard_host,
+            port=settings.dashboard_port,
+            log_level="warning",  # suppress uvicorn noise; use structlog
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        tasks.append(asyncio.create_task(server.serve(), name="dashboard_server"))
+        logger.info(
+            "dashboard_starting",
+            host=settings.dashboard_host,
+            port=settings.dashboard_port,
+            url=f"http://{settings.dashboard_host}:{settings.dashboard_port}",
+        )
+        print(
+            f"\n  Dashboard: http://{settings.dashboard_host}:{settings.dashboard_port}\n"
+        )
+
+    from mctrend.api.routes.events import broadcast
 
     try:
         while not shutdown.is_set():
             summary = await pipeline.run_cycle()
 
+            # Update dashboard cycle stats and broadcast
+            api_deps.update_cycle_stats(summary)
+            api_deps.update_competition_outcomes({
+                "cycle": summary.get("cycle"),
+                "started_at": summary.get("started_at"),
+                "narrative_outcomes": summary.get("competition_outcomes", []),
+                "token_outcomes": summary.get("token_competition_outcomes", []),
+            })
+            api_deps.update_narrative_board(summary.get("narrative_board", []))
+            broadcast("cycle_complete", summary)
+
             if summary.get("errors"):
                 logger.warning("cycle_had_errors", errors=summary["errors"])
 
-            # Wait for next cycle
+            # Wait for next cycle — interruptible by shutdown signal
             try:
                 await asyncio.wait_for(
                     shutdown.wait(),
-                    timeout=settings.polling_interval_tokens
+                    timeout=settings.polling_interval_tokens,
                 )
             except asyncio.TimeoutError:
                 pass  # Normal: timeout means we loop again
     finally:
-        logger.info("pipeline_shutting_down")
+        logger.info("pipeline_shutting_down", reason="signal_received")
+        for task in tasks:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if ws_adapter is not None:
+            await ws_adapter.stop()
         await pipeline.ingestion.close_all()
         await pipeline.delivery.close_all()
         db.close()
+        logger.info("pipeline_stopped")
 
 
 async def show_status(settings: Settings):
-    """Show current system status."""
+    """Show current system status including DB size."""
     db_path = settings.database_path
     if not Path(db_path).exists():
         print(f"Database not found at {db_path}. System has not been run yet.")
@@ -354,6 +794,10 @@ async def show_status(settings: Settings):
     gap_repo = SourceGapRepository(db)
 
     print("=== MC Trend Analysis System Status ===\n")
+    print(f"  Environment: {settings.environment}")
+    print(f"  Database:    {db_path}")
+    db_size_mb = db.get_size_bytes() / (1024 * 1024)
+    print(f"  DB size:     {db_size_mb:.2f} MB\n")
 
     # Token counts by status
     for status in ["new", "linked", "scored", "alerted", "expired", "discarded"]:
@@ -362,7 +806,10 @@ async def show_status(settings: Settings):
             print(f"  Tokens ({status}): {count}")
 
     # Active narratives
-    for state in ["EMERGING", "PEAKING", "DECLINING", "DEAD"]:
+    for state in [
+        "WEAK", "EMERGING", "RISING", "TRENDING", "FADING", "DEAD",
+        "PEAKING", "DECLINING",  # legacy names, still possible in an old database
+    ]:
         narratives = narrative_repo.get_active(states=[state])
         if narratives:
             print(f"  Narratives ({state}): {len(narratives)}")
@@ -386,6 +833,11 @@ async def show_status(settings: Settings):
     db.close()
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MC Trend Analysis — Real-time memecoin trend intelligence"
@@ -393,18 +845,48 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run single cycle and exit")
     parser.add_argument("--demo", action="store_true", help="Inject demo data for testing")
     parser.add_argument("--status", action="store_true", help="Show system status")
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Start operator dashboard API server alongside the pipeline",
+    )
     parser.add_argument("--env", default=".env", help="Path to .env file")
     args = parser.parse_args()
 
     settings = Settings.load(env_file=args.env)
     configure_logging(level=settings.log_level, log_format=settings.log_format)
 
-    if args.status:
-        asyncio.run(show_status(settings))
-    elif args.once or args.demo:
-        asyncio.run(run_once(settings, demo=args.demo))
-    else:
-        asyncio.run(run_continuous(settings))
+    logger.info("system_starting", environment=settings.environment)
+
+    # Run startup validation — fail fast with clear diagnostics
+    errors = validate_startup(settings, demo_mode=args.demo)
+    if errors:
+        print("\n[STARTUP VALIDATION FAILED]", file=sys.stderr)
+        for err in errors:
+            print(f"  ERROR: {err}", file=sys.stderr)
+        print("\nFix the above errors before starting the system.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        if args.status:
+            asyncio.run(show_status(settings))
+        elif args.once or (args.demo and not args.dashboard):
+            # --demo alone is one cycle; --demo --dashboard keeps serving it.
+            asyncio.run(run_once(settings, demo=args.demo))
+        else:
+            asyncio.run(
+                run_continuous(settings, dashboard=args.dashboard, demo=args.demo)
+            )
+    except SchemaVersionError as e:
+        print(f"\n[SCHEMA VERSION ERROR] {e}", file=sys.stderr)
+        print(
+            "Remove the database file and restart, or apply a migration.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except Exception as e:
+        logger.exception("fatal_error", error=str(e))
+        sys.exit(3)
 
 
 if __name__ == "__main__":

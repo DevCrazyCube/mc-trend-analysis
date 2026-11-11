@@ -9,13 +9,20 @@ from .adapters.base import SourceAdapter
 
 logger = structlog.get_logger(__name__)
 
+
 class IngestionManager:
     """Orchestrates data ingestion from multiple sources."""
 
     def __init__(self):
         self._token_adapters: list[SourceAdapter] = []
         self._event_adapters: list[SourceAdapter] = []
-        self._source_gaps: list[dict] = []
+
+        # Gaps that have been created this cycle and not yet drained
+        self._pending_gaps: list[dict] = []
+
+        # Sources for which a gap has been opened and not yet recovered.
+        # Prevents opening a new gap every cycle during an ongoing outage.
+        self._sources_with_open_gap: set[str] = set()
 
     def register_token_adapter(self, adapter: SourceAdapter):
         self._token_adapters.append(adapter)
@@ -63,25 +70,78 @@ class IngestionManager:
         return list(seen.values())
 
     def _record_source_gap(self, adapter: SourceAdapter):
-        """Record a source gap for tracking."""
+        """Record a source gap for tracking.
+
+        Only records a new gap if this source does not already have an open gap
+        tracked in this process.  This prevents repeated gap records for the
+        same continuous outage window.
+
+        Gaps are deduped again in the pipeline against the persisted DB state
+        so that restarts do not re-open gaps that were never closed.
+        """
+        source_name = adapter.source_name
+        if source_name in self._sources_with_open_gap:
+            # Gap already open for this source — do not create another
+            return
+
         gap = {
             "gap_id": str(uuid.uuid4()),
             "source_type": adapter.source_type,
-            "source_name": adapter.source_name,
+            "source_name": source_name,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._source_gaps.append(gap)
+        self._pending_gaps.append(gap)
+        self._sources_with_open_gap.add(source_name)
         logger.warning("source_gap_opened", **gap)
 
-    def get_source_health(self) -> list[dict]:
-        """Get health status of all registered adapters."""
-        health = []
+    def mark_source_recovered(self, source_name: str) -> None:
+        """Inform the manager that *source_name* has recovered.
+
+        Called by the pipeline when it closes the DB-persisted gap for a
+        source.  Allows a fresh gap to be recorded if the source fails again.
+        """
+        self._sources_with_open_gap.discard(source_name)
+
+    async def run_preflight_checks(self) -> dict[str, tuple[bool, str]]:
+        """Run auth/reachability checks on all registered event adapters that support it.
+
+        Called once at startup (before the first pipeline cycle) to surface
+        credential or configuration problems early.  Returns a dict keyed by
+        source_name with ``(authorized: bool, reason: str)`` tuples.
+
+        Does not affect adapter health state — preflight is informational only.
+        """
+        results: dict[str, tuple[bool, str]] = {}
+        for adapter in self._event_adapters:
+            if hasattr(adapter, "check_auth"):
+                try:
+                    ok, reason = await adapter.check_auth()
+                except Exception as exc:
+                    ok, reason = False, f"check_auth raised {exc}"
+                results[adapter.source_name] = (ok, reason)
+        return results
+
+    def get_source_health(self) -> dict[str, dict]:
+        """Get health status of all registered adapters, keyed by source_name."""
+        health: dict[str, dict] = {}
         for adapter in self._token_adapters + self._event_adapters:
-            health.append(adapter.get_source_meta())
+            meta = adapter.get_source_meta()
+            health[adapter.source_name] = meta
         return health
 
+    def get_source_health_list(self) -> list[dict]:
+        """Get health status of all registered adapters as a list."""
+        return list(self.get_source_health().values())
+
     def get_pending_gaps(self) -> list[dict]:
-        return [g for g in self._source_gaps if g.get("ended_at") is None]
+        """Return new source gaps created since the last call and drain the list.
+
+        Draining ensures each gap is returned exactly once.  The pipeline is
+        responsible for persisting them and deduplicating against the DB.
+        """
+        gaps = [g for g in self._pending_gaps if g.get("ended_at") is None]
+        self._pending_gaps.clear()
+        return gaps
 
     async def close_all(self):
         """Close all adapter clients."""

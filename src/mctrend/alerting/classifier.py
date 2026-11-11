@@ -46,11 +46,184 @@ ALERT_TIERS: dict[str, int] = {
 # The set of "high tier" prior alert types that qualify a token for take_profit_watch.
 _HIGH_TIER_TYPES = {"possible_entry", "high_potential_watch"}
 
-# Narrative states considered active enough for the top alert tiers.
-_ACTIVE_NARRATIVE_STATES = {"EMERGING", "PEAKING"}
+# The narrative lifecycle is WEAK -> EMERGING -> RISING -> TRENDING -> FADING -> DEAD
+# (mctrend.narrative.intelligence), and the pipeline only passes a token on to the
+# alert engine when its narrative is RISING or TRENDING.  PEAKING and DECLINING are
+# the names the lifecycle used before; they stay here so rows and callers written
+# with them keep their meaning (PEAKING = TRENDING, DECLINING = FADING).
 
-# Narrative states valid for take_profit_watch.
-_TAKE_PROFIT_NARRATIVE_STATES = {"PEAKING", "DECLINING"}
+# Narrative states considered active enough for the top alert tiers.
+_ACTIVE_NARRATIVE_STATES = {"EMERGING", "RISING", "TRENDING", "PEAKING"}
+
+# Narrative states valid for take_profit_watch: at the peak or just past it.
+_TAKE_PROFIT_NARRATIVE_STATES = {"TRENDING", "FADING", "PEAKING", "DECLINING"}
+
+
+def _state(narrative_state: str | None) -> str:
+    """The narrative state as the gates compare it: upper-case, never None."""
+    return (narrative_state or "").upper()
+
+
+def explain_rejection(
+    net_potential: float,
+    p_potential: float,
+    p_failure: float,
+    confidence: float,
+    risk_flags: list[str],
+    narrative_state: str = "EMERGING",
+    data_gaps: list[str] | None = None,
+    thresholds: AlertThresholds | None = None,
+) -> list[dict]:
+    """
+    Return a structured list of reasons why a scored token did not reach each
+    alert tier.  Intended for diagnostic logging and the dashboard rejection view.
+
+    Each entry is a dict:
+      code       — machine-readable reason code
+      tier       — the alert tier this reason blocked
+      actual     — the actual value (float or str; None for flag-based reasons)
+      threshold  — the required threshold (float or str; None for flag-based)
+      gap        — how far away from meeting the condition (positive = needs to
+                   increase; None for non-numeric reasons)
+
+    Only reasons that are actually failing are included.  A token that easily
+    passes a tier will not generate reasons for that tier.
+    """
+    if thresholds is None:
+        thresholds = AlertThresholds()
+    narrative_state = _state(narrative_state)
+
+    reasons: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Flag-based blockers (always shown when present)
+    # ------------------------------------------------------------------
+    for flag in risk_flags:
+        if flag in thresholds.discard_flags:
+            reasons.append({
+                "code": "discard_flag_active",
+                "tier": "all",
+                "actual": flag,
+                "threshold": None,
+                "gap": None,
+            })
+
+    blocking_flags_present = [f for f in risk_flags if f in thresholds.blocking_flags]
+    if blocking_flags_present:
+        reasons.append({
+            "code": "blocking_flag_caps_at_verify",
+            "tier": "possible_entry|high_potential_watch",
+            "actual": ",".join(blocking_flags_present),
+            "threshold": None,
+            "gap": None,
+        })
+
+    # ------------------------------------------------------------------
+    # Missing enrichment (data gaps)
+    # ------------------------------------------------------------------
+    _ENRICHMENT_GAPS = {
+        "holder_concentration", "liquidity_data", "wallet_clustering",
+        "deployer_history", "contract_authorities",
+    }
+    for gap in (data_gaps or []):
+        if gap in _ENRICHMENT_GAPS:
+            reasons.append({
+                "code": "missing_required_enrichment",
+                "tier": "rug_risk_dimension",
+                "actual": gap,
+                "threshold": None,
+                "gap": None,
+            })
+
+    # ------------------------------------------------------------------
+    # watch tier (net_potential >= 0.25)
+    # ------------------------------------------------------------------
+    if net_potential < thresholds.watch_min_net_potential:
+        reasons.append({
+            "code": "net_potential_below_watch",
+            "tier": "watch",
+            "actual": round(net_potential, 4),
+            "threshold": thresholds.watch_min_net_potential,
+            "gap": round(thresholds.watch_min_net_potential - net_potential, 4),
+        })
+
+    # ------------------------------------------------------------------
+    # verify tier (net_potential >= 0.35 AND confidence < 0.55)
+    # ------------------------------------------------------------------
+    if net_potential < thresholds.verify_min_net_potential:
+        reasons.append({
+            "code": "net_potential_below_verify",
+            "tier": "verify",
+            "actual": round(net_potential, 4),
+            "threshold": thresholds.verify_min_net_potential,
+            "gap": round(thresholds.verify_min_net_potential - net_potential, 4),
+        })
+
+    # ------------------------------------------------------------------
+    # high_potential_watch tier
+    # ------------------------------------------------------------------
+    if net_potential < thresholds.hpw_min_net_potential:
+        reasons.append({
+            "code": "net_potential_below_hpw",
+            "tier": "high_potential_watch",
+            "actual": round(net_potential, 4),
+            "threshold": thresholds.hpw_min_net_potential,
+            "gap": round(thresholds.hpw_min_net_potential - net_potential, 4),
+        })
+    if p_failure >= thresholds.hpw_max_p_failure:
+        reasons.append({
+            "code": "p_failure_too_high_for_hpw",
+            "tier": "high_potential_watch",
+            "actual": round(p_failure, 4),
+            "threshold": thresholds.hpw_max_p_failure,
+            "gap": round(p_failure - thresholds.hpw_max_p_failure, 4),
+        })
+    if confidence < thresholds.hpw_min_confidence:
+        reasons.append({
+            "code": "confidence_below_hpw_floor",
+            "tier": "high_potential_watch",
+            "actual": round(confidence, 4),
+            "threshold": thresholds.hpw_min_confidence,
+            "gap": round(thresholds.hpw_min_confidence - confidence, 4),
+        })
+    if narrative_state not in _ACTIVE_NARRATIVE_STATES:
+        reasons.append({
+            "code": "narrative_state_not_active",
+            "tier": "high_potential_watch|possible_entry",
+            "actual": narrative_state,
+            "threshold": "|".join(sorted(_ACTIVE_NARRATIVE_STATES)),
+            "gap": None,
+        })
+
+    # ------------------------------------------------------------------
+    # possible_entry tier
+    # ------------------------------------------------------------------
+    if net_potential < thresholds.pe_min_net_potential:
+        reasons.append({
+            "code": "net_potential_below_pe",
+            "tier": "possible_entry",
+            "actual": round(net_potential, 4),
+            "threshold": thresholds.pe_min_net_potential,
+            "gap": round(thresholds.pe_min_net_potential - net_potential, 4),
+        })
+    if p_failure >= thresholds.pe_max_p_failure:
+        reasons.append({
+            "code": "p_failure_too_high_for_pe",
+            "tier": "possible_entry",
+            "actual": round(p_failure, 4),
+            "threshold": thresholds.pe_max_p_failure,
+            "gap": round(p_failure - thresholds.pe_max_p_failure, 4),
+        })
+    if confidence < thresholds.pe_min_confidence:
+        reasons.append({
+            "code": "confidence_below_pe_floor",
+            "tier": "possible_entry",
+            "actual": round(confidence, 4),
+            "threshold": thresholds.pe_min_confidence,
+            "gap": round(thresholds.pe_min_confidence - confidence, 4),
+        })
+
+    return reasons
 
 
 def classify_alert(
@@ -75,9 +248,11 @@ def classify_alert(
     2. Check discard thresholds -> discard
     3. Check exit_risk (only if has_prior_alert and p_failure >= threshold) -> exit_risk
     4. Check blocking flags -> cap at verify
-    5. Check possible_entry thresholds + narrative must be EMERGING or PEAKING -> possible_entry
+    5. Check possible_entry thresholds + narrative must be active
+       (EMERGING, RISING or TRENDING) -> possible_entry
     6. Check high_potential_watch -> high_potential_watch
-    7. Check take_profit_watch (only if prior alert was high tier and narrative PEAKING/DECLINING) -> take_profit_watch
+    7. Check take_profit_watch (only if prior alert was high tier and narrative
+       TRENDING or FADING) -> take_profit_watch
     8. Check verify (net_potential >= threshold but confidence < verify_max) -> verify
     9. Check watch -> watch
     10. Otherwise -> ignore
@@ -89,6 +264,7 @@ def classify_alert(
     """
     if thresholds is None:
         thresholds = AlertThresholds()
+    narrative_state = _state(narrative_state)
 
     # ------------------------------------------------------------------
     # 1. Discard flags — immediate discard
@@ -124,7 +300,7 @@ def classify_alert(
     # ------------------------------------------------------------------
     # 5. Possible entry — strict criteria
     #    Docs: net_potential >= 0.60, P_failure < 0.30, confidence >= 0.65,
-    #          narrative EMERGING or PEAKING, no critical risk flags
+    #          narrative EMERGING, RISING or TRENDING, no critical risk flags
     #    Conservative tie-breaking:
     #      net_potential on boundary 0.60 -> meets (docs say >=)
     #      p_failure on boundary 0.30 -> does NOT meet (docs say <, boundary fails)
@@ -142,7 +318,7 @@ def classify_alert(
     # ------------------------------------------------------------------
     # 6. High potential watch
     #    Docs: net_potential >= 0.45, P_failure < 0.50, confidence >= 0.55,
-    #          narrative EMERGING or PEAKING
+    #          narrative EMERGING, RISING or TRENDING
     #    Conservative:
     #      net_potential on boundary 0.45 -> meets (>=)
     #      p_failure on boundary 0.50 -> does NOT meet (<, boundary fails)
@@ -160,7 +336,7 @@ def classify_alert(
     # ------------------------------------------------------------------
     # 7. Take profit watch — only for tokens with prior high-tier alerts
     #    Docs: prior alert was possible_entry or high_potential_watch,
-    #          net_potential still >= 0.35, narrative PEAKING or early DECLINING
+    #          net_potential still >= 0.35, narrative TRENDING or early FADING
     # ------------------------------------------------------------------
     if (
         has_prior_alert

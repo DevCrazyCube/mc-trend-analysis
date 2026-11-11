@@ -11,35 +11,84 @@ Flow:
   4. Score each linked token across 6 dimensions
   5. Classify and manage alerts
   6. Deliver alerts to configured channels
+  7. Expire stale alerts
+  8. Prune old data per retention policy
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 import structlog
 
+from mctrend.alerting.classifier import explain_rejection
 from mctrend.alerting.engine import AlertEngine
 from mctrend.correlation.linker import CorrelationEngine
 from mctrend.delivery.channels import DeliveryRouter
 from mctrend.ingestion.manager import IngestionManager
+from mctrend.ingestion.relevance import score_article_relevance, score_narrative_relevance
+from mctrend.narrative.discovery_engine import (
+    NarrativeDiscoveryEngine,
+    candidate_to_narrative_event,
+)
+from mctrend.narrative.scoring import build_narrative_board
+from mctrend.narrative.tier_classifier import (
+    TIER_4,
+    TIER_3,
+    classify_tier,
+    evidence_from_candidate,
+)
+from mctrend.narrative.entity_extraction import XEntityExtractor
+from mctrend.narrative.entity_tracker import SpikeConfig, XEntityTracker
+from mctrend.narrative.intelligence import (
+    NarrativeConfig,
+    NarrativeIntelligence,
+)
+from mctrend.narrative.spike_correlator import (
+    correlate_spike_with_tokens,
+    spike_to_narrative_event,
+)
 from mctrend.normalization.normalizer import (
     merge_narratives,
-    normalize_chain_snapshot,
     normalize_event,
     normalize_token,
+    normalize_token_name,
 )
 from mctrend.persistence.database import Database
 from mctrend.persistence.repositories import (
     AlertRepository,
     LinkRepository,
     NarrativeRepository,
+    RejectedCandidateRepository,
     ScoringRepository,
     SourceGapRepository,
     TokenRepository,
 )
 from mctrend.scoring.aggregator import ScoringAggregator
 
+if TYPE_CHECKING:
+    from mctrend.config.settings import Settings
+
 logger = structlog.get_logger(__name__)
+
+
+def _source_failure_mode(meta: dict) -> str:
+    """Compute the current failure mode for a source from its health metadata.
+
+    Returns one of:
+      - ``"healthy"``     — source is operational
+      - ``"rate-limited"`` — source is in rate-limit cooldown (429)
+      - ``"forbidden"``   — source returned 403 (auth/config failure)
+      - ``"unavailable"`` — source is unhealthy for another reason
+      - ``"unconfigured"`` — meta is empty (adapter not registered)
+    """
+    if not meta:
+        return "unconfigured"
+    if meta.get("in_rate_limit_cooldown"):
+        return "rate-limited"
+    if meta.get("healthy", True):
+        return "healthy"
+    return meta.get("failure_mode", "unavailable")
 
 
 class Pipeline:
@@ -53,6 +102,7 @@ class Pipeline:
         scorer: ScoringAggregator,
         alert_engine: AlertEngine,
         delivery: DeliveryRouter,
+        settings: "Settings | None" = None,
     ):
         self.db = db
         self.ingestion = ingestion
@@ -60,6 +110,7 @@ class Pipeline:
         self.scorer = scorer
         self.alert_engine = alert_engine
         self.delivery = delivery
+        self.settings = settings
 
         # Repositories
         self.token_repo = TokenRepository(db)
@@ -68,6 +119,58 @@ class Pipeline:
         self.scoring_repo = ScoringRepository(db)
         self.alert_repo = AlertRepository(db)
         self.gap_repo = SourceGapRepository(db)
+        self.rejected_repo = RejectedCandidateRepository(db)
+
+        # Token-stream narrative discovery (primary discovery source)
+        self._narrative_discovery = NarrativeDiscoveryEngine()
+
+        # X emergent entity extraction (corroboration only — not primary)
+        self._x_entity_extractor = XEntityExtractor()
+        self._x_entity_tracker = XEntityTracker(SpikeConfig())
+
+        # Narrative intelligence engine
+        ni_cfg = NarrativeConfig()
+        if settings and hasattr(settings, "narrative_intelligence"):
+            ni = settings.narrative_intelligence
+            ni_cfg = NarrativeConfig(
+                velocity_window_minutes=ni.velocity_window_minutes,
+                max_velocity=ni.max_velocity,
+                strength_w_source_count=ni.strength_w_source_count,
+                strength_w_velocity=ni.strength_w_velocity,
+                strength_w_recency=ni.strength_w_recency,
+                strength_w_diversity=ni.strength_w_diversity,
+                max_source_count=ni.max_source_count,
+                recency_decay_minutes=ni.recency_decay_minutes,
+                max_source_types=ni.max_source_types,
+                min_sources=ni.min_sources,
+                weak_threshold=ni.weak_threshold,
+                emerging_threshold=ni.emerging_threshold,
+                rising_threshold=ni.rising_threshold,
+                trending_threshold=ni.trending_threshold,
+                trending_min_sources=ni.trending_min_sources,
+                fading_threshold=ni.fading_threshold,
+                dead_threshold=ni.dead_threshold,
+                dead_timeout_minutes=ni.dead_timeout_minutes,
+                winner_min_strength=ni.winner_min_strength,
+                token_competition_margin=ni.token_competition_margin,
+                cluster_term_overlap_pct=ni.cluster_term_overlap_pct,
+                cluster_token_overlap_min=ni.cluster_token_overlap_min,
+                cluster_min_source_diversity=ni.cluster_min_source_diversity,
+            )
+        self.narrative_intel = NarrativeIntelligence(ni_cfg)
+
+        # Relevance filtering thresholds (from settings or defaults)
+        if settings and hasattr(settings, "narrative_intelligence"):
+            ni = settings.narrative_intelligence
+            self._articles_min_relevance = ni.articles_min_relevance_score
+            self._narratives_min_relevance = ni.narratives_min_relevance_score
+            self._relevance_positive_saturation = ni.relevance_positive_saturation
+            self._relevance_veto_override_threshold = ni.relevance_veto_override_threshold
+        else:
+            self._articles_min_relevance = 0.20
+            self._narratives_min_relevance = 0.15
+            self._relevance_positive_saturation = 1.5
+            self._relevance_veto_override_threshold = 0.15
 
         # Stats
         self._cycle_count = 0
@@ -75,8 +178,7 @@ class Pipeline:
         self._total_alerts_generated = 0
 
     async def run_cycle(self) -> dict:
-        """
-        Execute one full processing cycle.
+        """Execute one full processing cycle.
 
         Returns a summary dict with counts and status.
         """
@@ -89,125 +191,597 @@ class Pipeline:
             "started_at": cycle_start.isoformat(),
             "tokens_ingested": 0,
             "events_ingested": 0,
+            "articles_fetched": 0,
+            "articles_rejected_irrelevant": 0,
+            "narratives_blocked_low_relevance": 0,
+            "source_cooldown_active": 0,
             "links_created": 0,
             "tokens_scored": 0,
             "alerts_created": 0,
             "alerts_delivered": 0,
+            "alerts_expired": 0,
+            "rows_pruned": 0,
             "errors": [],
+            # Degraded-mode indicators: populated during ingest step
+            "news_source_available": True,
+            "news_failure_mode": "healthy",
+            "x_source_available": True,
+            "x_failure_mode": "healthy",
+            "narrative_path_offline": False,
+            "scoring_limited_reason": None,
+            # Token-stream narrative discovery metrics
+            "token_stream_candidates_total": 0,
+            "token_stream_candidates_emerging": 0,
+            "token_stream_top_candidates": [],
+            # Narrative board metrics
+            "narrative_board": [],
+            "narratives_detected": 0,
+            "narratives_strong": 0,
+            "narratives_emerging": 0,
+            "narratives_weak": 0,
+            "narratives_filtered_noise": 0,
+            # X spike metrics
+            "x_entities_extracted": 0,
+            "x_spikes_detected": 0,
+            "x_spike_token_matches": 0,
         }
 
+        # Step 1: Ingest
         try:
-            # --- Step 1: Ingest ---
             raw_tokens = await self.ingestion.fetch_tokens()
             raw_events = await self.ingestion.fetch_events()
 
-            # Record source gaps
+            # Record source gaps — deduplicated against the DB so that a
+            # restart does not re-open a gap that is already tracked there.
+            existing_open_gap_sources = {
+                g["source_name"] for g in self.gap_repo.get_open_gaps()
+            }
             for gap in self.ingestion.get_pending_gaps():
-                self.gap_repo.open_gap(gap)
+                if gap["source_name"] not in existing_open_gap_sources:
+                    self.gap_repo.open_gap(gap)
+                    existing_open_gap_sources.add(gap["source_name"])
+                # else: gap already open in DB for this source — do not duplicate
 
-            # --- Step 2: Normalize and store tokens ---
-            new_tokens = []
-            for raw in raw_tokens:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cooldown_count = 0
+            for source_name, meta in self.ingestion.get_source_health().items():
+                if meta.get("in_rate_limit_cooldown"):
+                    cooldown_count += 1
+                if meta.get("healthy"):
+                    closed = self.gap_repo.close_open_gaps_for_source(source_name, now_iso)
+                    if closed:
+                        logger.info("source_gap_closed",
+                                    source=source_name, gaps_closed=closed)
+                        # Inform manager so it allows a fresh gap if source fails again
+                        self.ingestion.mark_source_recovered(source_name)
+            summary["source_cooldown_active"] = cooldown_count
+
+            # Degraded-mode detection: classify each narrative source by failure_mode.
+            # Only set offline when a source IS registered but degraded —
+            # an unregistered source ("unconfigured") is not an outage.
+            source_health = self.ingestion.get_source_health()
+
+            news_meta = source_health.get("newsapi", {})
+            news_fm = _source_failure_mode(news_meta)
+            summary["news_failure_mode"] = news_fm
+            if news_meta and news_fm != "healthy":
+                summary["news_source_available"] = False
+                summary["narrative_path_offline"] = True
+                if news_fm == "rate-limited":
+                    remaining = news_meta.get("cooldown_remaining_seconds", 0)
+                    reason = (
+                        f"newsapi rate-limited (cooldown {remaining:.0f}s remaining, "
+                        f"episode {news_meta.get('cooldown_episodes', '?')})"
+                    )
+                elif news_fm == "forbidden":
+                    reason = "newsapi forbidden (check NEWSAPI_KEY)"
+                else:
+                    reason = f"newsapi {news_fm}"
+                summary["scoring_limited_reason"] = reason
+                logger.warning(
+                    "pipeline_degraded_mode",
+                    source="newsapi",
+                    failure_mode=news_fm,
+                    reason=reason,
+                    tokens_available=len(raw_tokens) > 0,
+                    hint="Tokens will be ingested but narrative-driven scoring will be zero until source recovers.",
+                )
+
+            x_meta = source_health.get("x", {})
+            x_fm = _source_failure_mode(x_meta)
+            summary["x_failure_mode"] = x_fm
+            if x_meta and x_fm != "healthy":
+                summary["x_source_available"] = False
+                if x_fm == "rate-limited":
+                    x_remaining = x_meta.get("cooldown_remaining_seconds", 0)
+                    x_reason = (
+                        f"x rate-limited (cooldown {x_remaining:.0f}s remaining, "
+                        f"episode {x_meta.get('cooldown_episodes', '?')})"
+                    )
+                elif x_fm == "forbidden":
+                    x_reason = "x forbidden (check X_API_BEARER_TOKEN)"
+                else:
+                    x_reason = f"x {x_fm}"
+                logger.warning(
+                    "pipeline_degraded_mode",
+                    source="x",
+                    failure_mode=x_fm,
+                    reason=x_reason,
+                    hint="X narrative detection unavailable; pipeline continues with other sources.",
+                )
+
+        except Exception as e:
+            logger.error("pipeline_ingest_error", error=str(e))
+            summary["errors"].append(f"ingest: {e}")
+            raw_tokens, raw_events = [], []
+
+        # Step 2: Normalize and store tokens
+        new_tokens = []
+        for raw in raw_tokens:
+            try:
                 normalized = normalize_token(raw)
                 if normalized is None:
                     continue
-
-                # Check for duplicate by address
                 existing = self.token_repo.get_by_address(normalized["address"])
                 if existing:
-                    continue  # Already known
-
+                    continue
                 self.token_repo.save(normalized)
                 new_tokens.append(normalized)
+            except Exception as e:
+                logger.error("token_normalization_error",
+                             error=str(e), raw=str(raw)[:200])
+                summary["errors"].append(f"normalize_token: {e}")
 
-            summary["tokens_ingested"] = len(new_tokens)
+        summary["tokens_ingested"] = len(new_tokens)
 
-            # --- Step 3: Normalize and store events/narratives ---
-            new_events = []
-            for raw in raw_events:
+        # Step 3: Normalize and store events/narratives
+        # Step 3a: Article gate — filter raw events by relevance before normalization.
+        # Prevents irrelevant articles (sports, politics, entertainment) from becoming narratives.
+        summary["articles_fetched"] = len(raw_events)
+        articles_rejected = 0
+        filtered_events: list[dict] = []
+        for raw in raw_events:
+            title = raw.get("_title") or raw.get("description", "")
+            description = raw.get("_description", "")
+            source_name_raw = raw.get("_source_name") or raw.get("source_name", "")
+            relevance = score_article_relevance(
+                title=title,
+                description=description,
+                source_name=source_name_raw,
+                positive_saturation=self._relevance_positive_saturation,
+                veto_override_threshold=self._relevance_veto_override_threshold,
+            )
+            if relevance >= self._articles_min_relevance:
+                filtered_events.append(raw)
+            else:
+                articles_rejected += 1
+                logger.debug(
+                    "article_rejected_irrelevant",
+                    title=title[:80],
+                    source=source_name_raw,
+                    relevance=round(relevance, 3),
+                    threshold=self._articles_min_relevance,
+                )
+        summary["articles_rejected_irrelevant"] = articles_rejected
+        if articles_rejected:
+            logger.info(
+                "article_gate_summary",
+                fetched=len(raw_events),
+                rejected=articles_rejected,
+                passed=len(filtered_events),
+            )
+
+        # Step 3b: Token-stream narrative discovery (PRIMARY) + X corroboration.
+        #
+        # Architecture:
+        #   Primary source  — token stream: repeated terms across launched tokens
+        #   Corroboration   — X spikes: boost existing token-stream candidates
+        #   Independent     — X spikes without token-stream match still produce
+        #                     their own x_spike_detection narrative events
+        #
+        # This inverts the old token→narrative direction:
+        #   narrative candidates emerge from token patterns FIRST,
+        #   then get corroborated by X, news, and other sources.
+        token_stream_events: list[dict] = []
+        spike_events: list[dict] = []
+        spikes: list[dict] = []
+        x_candidates: dict = {}
+
+        try:
+            # --- 3b-i: Token stream discovery (primary) ---
+            # Use all tokens from the last 2h so the discovery engine sees
+            # the full pattern, not just new tokens from this cycle alone.
+            recent_tokens = self.token_repo.get_recent(hours=2)
+            self._narrative_discovery.process_token_batch(recent_tokens)
+
+            # --- 3b-ii: X entity extraction + spike detection (corroboration) ---
+            x_events = [e for e in filtered_events if e.get("source_type") == "social_media"]
+            if x_events:
+                x_candidates = self._x_entity_extractor.extract_from_tweets(x_events)
+                x_candidates = self._x_entity_extractor.merge_similar(x_candidates)
+                x_candidates = self._x_entity_extractor.reject_noise(x_candidates)
+                self._x_entity_tracker.update(x_candidates)
+                spikes = self._x_entity_tracker.detect_spikes()
+                self._x_entity_tracker.prune()
+
+            # --- 3b-iii: X corroboration applied to token-stream candidates ---
+            # X spikes that match token-stream candidates boost their confidence.
+            # X spikes without a matching candidate are untouched here.
+            if spikes:
+                self._narrative_discovery.apply_x_corroboration(spikes)
+
+            # --- 3b-iv: Emit token-stream narrative events ---
+            emerging = self._narrative_discovery.get_emerging_candidates()
+            for cand in emerging:
+                token_stream_events.append(candidate_to_narrative_event(cand))
+
+            # Prune decayed candidates
+            self._narrative_discovery.prune()
+
+            # --- 3b-v: Emit X spike events for spikes with token matches ---
+            # These are independent of token-stream candidates.  A spike that
+            # matched a candidate already boosted that candidate's confidence;
+            # it still produces a separate x_spike narrative event.
+            if spikes:
+                for spike_token_batch in [self.token_repo.get_recent(hours=8)]:
+                    for spike in spikes:
+                        token_matches = correlate_spike_with_tokens(spike, spike_token_batch)
+                        best_match = token_matches[0] if token_matches else None
+                        spike_event = spike_to_narrative_event(spike, best_match)
+                        spike_events.append(spike_event)
+
+            # Cycle summary: token-stream discovery metrics
+            discovery_summary = self._narrative_discovery.get_summary()
+            summary.update(discovery_summary)
+
+            # --- Build narrative board from all active candidates ---
+            all_candidates = list(self._narrative_discovery._candidates.values())
+            board = build_narrative_board(all_candidates, include_noise=False)
+            self._current_board = board  # available for tier lookups during alerting
+            summary["narrative_board"] = board
+            # Per-cycle classification counts for logging
+            from collections import Counter as _Counter
+            cls_counts = _Counter(e["classification"] for e in board)
+            summary["narratives_detected"] = len(board)
+            summary["narratives_strong"] = cls_counts.get("STRONG", 0)
+            summary["narratives_emerging"] = cls_counts.get("EMERGING", 0)
+            summary["narratives_weak"] = cls_counts.get("WEAK", 0)
+            summary["narratives_filtered_noise"] = sum(
+                1 for c in all_candidates
+                if c.token_count < 3  # NOISE threshold
+            )
+
+            if board:
+                logger.info(
+                    "narrative_board_computed",
+                    total=len(board),
+                    strong=cls_counts.get("STRONG", 0),
+                    emerging=cls_counts.get("EMERGING", 0),
+                    weak=cls_counts.get("WEAK", 0),
+                    top_terms=[e["term"] for e in board[:5]],
+                )
+
+            # Cycle summary: X spike metrics
+            summary["x_entities_extracted"] = len(x_candidates)
+            summary["x_spikes_detected"] = len(spikes)
+            if spikes:
+                recent8 = self.token_repo.get_recent(hours=8)
+                summary["x_spike_token_matches"] = sum(
+                    1 for s in spikes if correlate_spike_with_tokens(s, recent8)
+                )
+                logger.info(
+                    "x_discovery_cycle_complete",
+                    entities_extracted=len(x_candidates),
+                    spikes_detected=len(spikes),
+                    spike_entities=[s["entity"] for s in spikes],
+                )
+
+            if emerging:
+                logger.info(
+                    "token_stream_narrative_discovery",
+                    candidates_emerging=len(emerging),
+                    top_candidates=[c.canonical_name for c in emerging[:5]],
+                )
+
+        except Exception as e:
+            logger.error("narrative_discovery_error", error=str(e))
+            summary["errors"].append(f"narrative_discovery: {e}")
+
+        # Combine: filtered news/social events + token-stream events + X spike events
+        all_events_for_normalization = filtered_events + token_stream_events + spike_events
+
+        new_events = []
+        for raw in all_events_for_normalization:
+            try:
                 normalized = normalize_event(raw)
                 if normalized is None:
                     continue
-
-                # Check for existing narrative with overlapping terms
                 existing = self._find_matching_narrative(normalized["anchor_terms"])
                 if existing:
-                    # Merge into existing narrative
                     merged = merge_narratives(existing, raw)
                     self.narrative_repo.save(merged)
                 else:
                     self.narrative_repo.save(normalized)
                     new_events.append(normalized)
+            except Exception as e:
+                logger.error("event_normalization_error", error=str(e))
+                summary["errors"].append(f"normalize_event: {e}")
 
-            summary["events_ingested"] = len(new_events)
+        summary["events_ingested"] = len(new_events)
 
-            # --- Step 4: Correlate tokens with narratives ---
-            active_narratives = self.narrative_repo.get_active(
-                states=["EMERGING", "PEAKING"]
+        # Step 3.4: Apply relevance gate to ALL narratives before evaluation/clustering/competition.
+        # This is the authoritative relevance gate — blocked narratives are excluded from the
+        # entire downstream pipeline, not just correlation.
+        narratives_blocked_early = 0
+        try:
+            all_narratives_for_relevance = self.narrative_repo.get_active()
+            for narrative in all_narratives_for_relevance:
+                anchor_terms = narrative.get("anchor_terms") or []
+                if isinstance(anchor_terms, str):
+                    import json as _json
+                    try:
+                        anchor_terms = _json.loads(anchor_terms)
+                    except Exception:
+                        anchor_terms = []
+                sources = narrative.get("sources") or []
+                if isinstance(sources, str):
+                    import json as _json
+                    try:
+                        sources = _json.loads(sources)
+                    except Exception:
+                        sources = []
+                source_names = [s.get("source_name", "") for s in sources if isinstance(s, dict)]
+                rel = score_narrative_relevance(
+                    anchor_terms=anchor_terms,
+                    description=narrative.get("description", ""),
+                    source_names=source_names,
+                    positive_saturation=self._relevance_positive_saturation,
+                    veto_override_threshold=self._relevance_veto_override_threshold,
+                )
+                is_blocked = rel < self._narratives_min_relevance
+                if is_blocked:
+                    narratives_blocked_early += 1
+                    logger.info(
+                        "narrative_relevance_gate_blocks",
+                        narrative_id=narrative.get("narrative_id"),
+                        description=str(narrative.get("description", ""))[:60],
+                        relevance=round(rel, 3),
+                        threshold=self._narratives_min_relevance,
+                    )
+                # Mark narrative with relevance status for use downstream
+                # Store as 1 for blocked, 0 for not blocked (integer for SQLite)
+                self.narrative_repo.update_fields(
+                    narrative.get("narrative_id"),
+                    {
+                        "relevance_blocked": 1 if is_blocked else 0,
+                        "relevance_score": round(rel, 3)
+                    }
+                )
+        except Exception as e:
+            logger.error("pipeline_relevance_gate_error", error=str(e))
+            summary["errors"].append(f"relevance_gate: {e}")
+
+        if narratives_blocked_early:
+            logger.info(
+                "narrative_relevance_gate_summary",
+                blocked=narratives_blocked_early,
+                total=len(all_narratives_for_relevance),
             )
-            # Get recently ingested tokens (status = "new")
+
+        # Step 3.5: Evaluate non-terminal narratives through intelligence engine.
+        # Filters out relevance-blocked narratives.
+        # Computes velocity, strength, and lifecycle state for each narrative.
+        narratives_evaluated = 0
+        try:
+            all_narratives = self.narrative_repo.get_active()
+            # Filter out relevance-blocked narratives before evaluation
+            # relevance_blocked is stored as 0/1 in the database
+            all_narratives = [n for n in all_narratives if not n.get("relevance_blocked")]
+            now = datetime.now(timezone.utc)
+            for narrative in all_narratives:
+                try:
+                    updates = self.narrative_intel.transition_narrative(narrative, now)
+                    if updates:
+                        nid = narrative.get("narrative_id")
+                        self.narrative_repo.update_fields(nid, updates)
+                        narratives_evaluated += 1
+                except Exception as e:
+                    logger.error(
+                        "narrative_evaluation_error",
+                        narrative_id=narrative.get("narrative_id"),
+                        error=str(e),
+                    )
+            if narratives_evaluated:
+                logger.info("narratives_evaluated", count=narratives_evaluated)
+        except Exception as e:
+            logger.error("pipeline_narrative_eval_error", error=str(e))
+            summary["errors"].append(f"narrative_eval: {e}")
+
+        summary["narratives_evaluated"] = narratives_evaluated
+
+        # Step 3.6: Cluster narratives for valid competition grouping.
+        # Filters out relevance-blocked narratives.
+        try:
+            scoring_narratives = self.narrative_repo.get_for_scoring()
+            # Filter out relevance-blocked narratives
+            scoring_narratives = [n for n in scoring_narratives if not n.get("relevance_blocked")]
+            if scoring_narratives:
+                # Build token_links map for token-overlap clustering
+                narr_token_links: dict[str, list[str]] = {}
+                for narr in scoring_narratives:
+                    nid = narr.get("narrative_id", "")
+                    links_for_narr = self.link_repo.get_active_for_narrative(nid)
+                    narr_token_links[nid] = [
+                        lnk["token_id"] for lnk in links_for_narr
+                    ]
+
+                cluster_map = self.narrative_intel.cluster_narratives(
+                    scoring_narratives, narr_token_links,
+                )
+                # Persist cluster_id on narratives
+                for nid, cid in cluster_map.items():
+                    self.narrative_repo.update_fields(nid, {"cluster_id": cid})
+        except Exception as e:
+            logger.error("pipeline_clustering_error", error=str(e))
+            summary["errors"].append(f"clustering: {e}")
+
+        # Step 3.7: Narrative competition — select winners per cluster group.
+        # Persist competition_status and competition_rank on narratives.
+        # Store full outcomes for dashboard visibility.
+        # Filters out relevance-blocked narratives.
+        competition_outcomes: list[dict] = []
+        try:
+            fresh_scoring = self.narrative_repo.get_for_scoring()
+            # Filter out relevance-blocked narratives
+            fresh_scoring = [n for n in fresh_scoring if not n.get("relevance_blocked")]
+            if fresh_scoring:
+                ranked = self.narrative_intel.select_narrative_winners(fresh_scoring)
+                for n in ranked:
+                    nid = n.get("narrative_id", "")
+                    self.narrative_repo.update_fields(nid, {
+                        "competition_status": n.get("competition_status"),
+                        "competition_rank": n.get("competition_rank"),
+                    })
+                    competition_outcomes.append({
+                        "narrative_id": nid,
+                        "narrative_name": n.get("description", n.get("name")),
+                        "state": n.get("state"),
+                        "narrative_strength": n.get("narrative_strength"),
+                        "velocity_state": n.get("velocity_state"),
+                        "cluster_id": n.get("cluster_id"),
+                        "competition_status": n.get("competition_status"),
+                        "competition_rank": n.get("competition_rank"),
+                        "suppression_reasons": n.get("suppression_reasons", []),
+                        "winner_explanation": n.get("winner_explanation"),
+                    })
+                logger.info(
+                    "narrative_competition_complete",
+                    total=len(ranked),
+                    winners=sum(
+                        1 for n in ranked
+                        if n.get("competition_status") in ("winner", "no_contest")
+                    ),
+                )
+        except Exception as e:
+            logger.error("pipeline_narrative_competition_error", error=str(e))
+            summary["errors"].append(f"narrative_competition: {e}")
+
+        summary["competition_outcomes"] = competition_outcomes
+
+        # Step 4: Correlate tokens with narratives
+        # Use scoring-eligible narratives for correlation (EMERGING, RISING, TRENDING)
+        try:
+            candidate_narratives = self.narrative_repo.get_for_scoring()
+
+            # Step 4a: Filter narratives by relevance gate (already applied in Step 3.4).
+            # Here we use the cached relevance_blocked flag for efficiency.
+            active_narratives = [n for n in candidate_narratives if not n.get("relevance_blocked")]
+            narratives_blocked = len(candidate_narratives) - len(active_narratives)
+            summary["narratives_blocked_low_relevance"] = narratives_blocked
+            if narratives_blocked:
+                logger.info(
+                    "narrative_relevance_gate_blocks_correlation",
+                    candidates=len(candidate_narratives),
+                    blocked=narratives_blocked,
+                    passed=len(active_narratives),
+                )
+
             tokens_to_correlate = self.token_repo.list_by_status("new", limit=200)
 
             links_created = 0
             for token in tokens_to_correlate:
-                links = self.correlator.correlate_token(token, active_narratives)
-                for link in links:
-                    # Check if link already exists
-                    existing_links = self.link_repo.get_for_token(token["token_id"])
-                    already_linked = any(
-                        el.get("narrative_id") == link["narrative_id"]
-                        for el in existing_links
-                    )
-                    if not already_linked:
-                        self.link_repo.save(link)
-                        links_created += 1
+                try:
+                    links = self.correlator.correlate_token(token, active_narratives)
+                    for link in links:
+                        existing_links = self.link_repo.get_for_token(token["token_id"])
+                        already_linked = any(
+                            el.get("narrative_id") == link["narrative_id"]
+                            for el in existing_links
+                        )
+                        if not already_linked:
+                            self.link_repo.save(link)
+                            links_created += 1
 
-                # Update token status if linked
-                token_links = self.link_repo.get_for_token(token["token_id"])
-                if token_links:
-                    self.token_repo.update_status(
-                        token["token_id"], "linked", "narrative_correlated"
-                    )
+                    token_links = self.link_repo.get_for_token(token["token_id"])
+                    if token_links:
+                        self.token_repo.update_status(
+                            token["token_id"], "linked", "narrative_correlated"
+                        )
+                except Exception as e:
+                    logger.error("token_correlation_error",
+                                 token_id=token.get("token_id"), error=str(e))
+                    summary["errors"].append(f"correlate:{token.get('token_id')}: {e}")
 
-            # OG resolution for namespaces with multiple tokens
+            # OG resolution
             for narrative in active_narratives:
-                nid = narrative.get("narrative_id", narrative.get("id", ""))
-                namespace_links = self.link_repo.get_active_for_narrative(nid)
-                if len(namespace_links) > 1:
-                    # Build candidate info and resolve
-                    token_launch_times = {}
-                    for link in namespace_links:
-                        tok = self.token_repo.get_by_id(link["token_id"])
-                        if tok:
-                            token_launch_times[link["token_id"]] = tok.get("launch_time", "")
-
-                    resolved = self.correlator.resolve_namespace(
-                        namespace_links, token_launch_times
-                    )
-                    for updated_link in resolved:
-                        self.link_repo.save(updated_link)
+                try:
+                    nid = narrative.get("narrative_id", narrative.get("id", ""))
+                    namespace_links = self.link_repo.get_active_for_narrative(nid)
+                    if len(namespace_links) > 1:
+                        token_launch_times: dict[str, datetime] = {}
+                        for link in namespace_links:
+                            tok = self.token_repo.get_by_id(link["token_id"])
+                            if tok and tok.get("launch_time"):
+                                try:
+                                    lt = datetime.fromisoformat(
+                                        tok["launch_time"].replace("Z", "+00:00")
+                                    )
+                                    if lt.tzinfo is None:
+                                        lt = lt.replace(tzinfo=timezone.utc)
+                                    token_launch_times[link["token_id"]] = lt
+                                except (ValueError, TypeError):
+                                    pass
+                        resolved = self.correlator.resolve_namespace(
+                            namespace_links, token_launch_times
+                        )
+                        for updated_link in resolved:
+                            self.link_repo.save(updated_link)
+                except Exception as e:
+                    logger.error("og_resolution_error",
+                                 narrative_id=narrative.get("narrative_id"),
+                                 error=str(e))
+                    summary["errors"].append(f"og_resolve: {e}")
 
             summary["links_created"] = links_created
+        except Exception as e:
+            logger.error("pipeline_correlation_error", error=str(e))
+            summary["errors"].append(f"correlation: {e}")
 
-            # --- Step 5: Score linked tokens ---
-            linked_tokens = self.token_repo.list_by_status("linked", limit=200)
-            scored_count = 0
+        # Step 5 & 6: Score linked tokens, apply quality gating & competition, classify alerts
+        linked_tokens = self.token_repo.list_by_status("linked", limit=200)
+        scored_count = 0
+        quality_gated_count = 0
 
-            for token in linked_tokens:
-                token_links = self.link_repo.get_for_token(token["token_id"])
-                for link in token_links:
-                    if link.get("status") != "active":
-                        continue
+        # Collect all scored tokens per narrative for competition layer
+        narrative_scored_tokens: dict[str, list[dict]] = {}
 
-                    narrative = self.narrative_repo.get_by_id(link["narrative_id"])
-                    if narrative is None:
-                        continue
+        for token in linked_tokens:
+            token_links = self.link_repo.get_for_token(token["token_id"])
+            for link in token_links:
+                if link.get("status") != "active":
+                    continue
 
-                    # Build data packages for scorer
+                narrative = self.narrative_repo.get_by_id(link["narrative_id"])
+                if narrative is None:
+                    continue
+
+                # Quality gate: skip narratives not meeting scoring eligibility
+                if not self.narrative_intel.is_scoring_eligible(narrative):
+                    reason = self.narrative_intel.get_rejection_reason(narrative)
+                    logger.debug(
+                        "narrative_quality_gate_blocked",
+                        narrative_id=narrative.get("narrative_id"),
+                        state=narrative.get("state"),
+                        reason=reason,
+                    )
+                    quality_gated_count += 1
+                    continue
+
+                try:
                     snapshot = self.token_repo.get_latest_snapshot(token["token_id"])
                     chain_data = self._build_chain_data(token, snapshot)
                     narrative_data = self._build_narrative_data(narrative, link)
-                    social_data = {}  # Would come from social adapters
+                    social_data = {}
                     link_data = self._build_link_data(link)
 
                     scored = self.scorer.score_token(
@@ -223,33 +797,209 @@ class Pipeline:
                     self.scoring_repo.save(scored)
                     scored_count += 1
 
-                    # --- Step 6: Alert classification ---
-                    alert = self.alert_engine.process_scored_token(
-                        scored_token=scored,
-                        token=token,
-                        narrative=narrative,
-                        link=link,
+                    # Collect for competition layer
+                    nid = link["narrative_id"]
+                    narrative_scored_tokens.setdefault(nid, []).append({
+                        "scored": scored,
+                        "token": token,
+                        "narrative": narrative,
+                        "link": link,
+                    })
+
+                except Exception as e:
+                    logger.error(
+                        "token_scoring_error",
+                        token_id=token.get("token_id"),
+                        link_id=link.get("link_id"),
+                        error=str(e),
+                    )
+                    summary["errors"].append(
+                        f"score:{token.get('token_id')}:{link.get('link_id')}: {e}"
                     )
 
-                    if alert:
-                        summary["alerts_created"] += 1
-                        self._total_alerts_generated += 1
-
-                        # --- Step 7: Deliver ---
-                        logs = await self.delivery.deliver_alert(alert)
-                        summary["alerts_delivered"] += len(
-                            [l for l in logs if l.get("status") == "delivered"]
-                        )
-
-                # Update token status to scored
+            try:
                 self.token_repo.update_status(
                     token["token_id"], "scored", "scoring_complete"
                 )
+            except Exception as e:
+                logger.error("token_status_update_error",
+                             token_id=token.get("token_id"), error=str(e))
 
-            summary["tokens_scored"] = scored_count
-            self._total_tokens_processed += scored_count
+        summary["tokens_scored"] = scored_count
+        summary["quality_gated"] = quality_gated_count
+        self._total_tokens_processed += scored_count
 
-            # --- Step 8: Check expired alerts ---
+        # Step 5.5: Competition layer — strict winner-takes-all.
+        # No fallback: only RISING+ narratives may produce alerts.
+        # Only rank-1 token per narrative proceeds to alert classification.
+        # All others are suppressed with structured reasons.
+        suppressed_count = 0
+        token_competition_outcomes: list[dict] = []
+
+        for nid, items in narrative_scored_tokens.items():
+            # Token competition: rank tokens within this narrative
+            # Normalize token names to collapse variants (e.g., "$MOON" and "MOON" -> "moon")
+            tokens_for_competition = []
+            normalized_names: dict[str, list[dict]] = {}  # normalized_name -> list of candidates
+
+            for item in items:
+                token_name = item["token"].get("name", "")
+                normalized = normalize_token_name(token_name)
+
+                candidate = {
+                    "token_id": item["token"]["token_id"],
+                    "net_potential": item["scored"].get("net_potential", 0.0) or 0.0,
+                    "_item": item,
+                    "_original_name": token_name,
+                    "_normalized_name": normalized,
+                }
+                tokens_for_competition.append(candidate)
+                normalized_names.setdefault(normalized, []).append(candidate)
+
+            # Log normalization collapses (multiple tokens with same normalized name)
+            collapse_count = 0
+            for normalized, candidates in normalized_names.items():
+                if len(candidates) > 1:
+                    collapse_count += 1
+                    original_names = [c["_original_name"] for c in candidates]
+                    logger.info(
+                        "token_name_normalization_collapse",
+                        narrative_id=nid,
+                        normalized_name=normalized,
+                        original_names=original_names,
+                        count=len(candidates),
+                    )
+
+            ranked = self.narrative_intel.select_token_winners(tokens_for_competition)
+
+            for entry in ranked:
+                token_competition_outcomes.append({
+                    "narrative_id": nid,
+                    "token_id": entry.get("token_id"),
+                    "token_name": entry["_item"]["token"].get("name"),
+                    "net_potential": entry.get("net_potential"),
+                    "token_competition_status": entry.get("token_competition_status"),
+                    "suppression_reasons": entry.get("suppression_reasons", []),
+                    "winner_explanation": entry.get("winner_explanation"),
+                })
+
+            for entry in ranked:
+                item = entry["_item"]
+                scored = item["scored"]
+                token = item["token"]
+                narrative = item["narrative"]
+                link = item["link"]
+                competition_status = entry.get("token_competition_status", "winner")
+                suppression_reasons = entry.get("suppression_reasons", [])
+
+                # Alert gating: narrative must be RISING+ (strict, no fallback)
+                if not self.narrative_intel.is_alert_eligible(narrative):
+                    narr_reasons = self.narrative_intel.get_suppression_reasons(narrative)
+                    logger.info(
+                        "alert_narrative_gate_failed",
+                        token_id=token.get("token_id"),
+                        narrative_id=narrative.get("narrative_id"),
+                        narrative_state=narrative.get("state"),
+                        suppression_reasons=[r["code"] for r in narr_reasons],
+                    )
+                    self._handle_rejection(
+                        scored, token, narrative,
+                        extra_reasons=narr_reasons,
+                    )
+                    suppressed_count += 1
+                    continue
+
+                # Tier-aware alert policy: T4 never alerts, T3 heavily downweighted
+                narrative_tier = self._get_narrative_tier(narrative)
+                if narrative_tier == TIER_4:
+                    logger.info(
+                        "alert_tier_gate_blocked",
+                        token_id=token.get("token_id"),
+                        narrative_id=narrative.get("narrative_id"),
+                        tier=narrative_tier,
+                        reason="T4 narratives never produce alerts",
+                    )
+                    self._handle_rejection(
+                        scored, token, narrative,
+                        extra_reasons=[{
+                            "code": "tier_4_blocked",
+                            "reason": "T4 (noise) narratives are not eligible for alerts",
+                        }],
+                    )
+                    suppressed_count += 1
+                    continue
+
+                if narrative_tier == TIER_3:
+                    # T3 can only alert if confidence is high enough
+                    conf = scored.get("confidence_score", 0.0)
+                    net = scored.get("net_potential", 0.0)
+                    if conf < 0.6 or net < 0.3:
+                        logger.info(
+                            "alert_tier_gate_downweighted",
+                            token_id=token.get("token_id"),
+                            narrative_id=narrative.get("narrative_id"),
+                            tier=narrative_tier,
+                            confidence=conf,
+                            net_potential=net,
+                            reason="T3 narrative below elevated thresholds",
+                        )
+                        self._handle_rejection(
+                            scored, token, narrative,
+                            extra_reasons=[{
+                                "code": "tier_3_threshold",
+                                "reason": f"T3 (token echo) requires confidence>=0.6 and net>=0.3 (got {conf:.2f}, {net:.2f})",
+                            }],
+                        )
+                        suppressed_count += 1
+                        continue
+
+                # Strict winner-takes-all: only "winner" proceeds
+                if competition_status != "winner":
+                    logger.info(
+                        "token_suppressed",
+                        token_id=token.get("token_id"),
+                        narrative_id=narrative.get("narrative_id"),
+                        competition_status=competition_status,
+                        suppression_reasons=[r["code"] for r in suppression_reasons],
+                    )
+                    self._handle_rejection(
+                        scored, token, narrative,
+                        extra_reasons=suppression_reasons,
+                    )
+                    suppressed_count += 1
+                    continue
+
+                # Step 6: Alert classification — only the single winner reaches here
+                alert = self.alert_engine.process_scored_token(
+                    scored_token=scored,
+                    token=token,
+                    narrative=narrative,
+                    link=link,
+                )
+
+                if alert:
+                    summary["alerts_created"] += 1
+                    self._total_alerts_generated += 1
+
+                    # Step 7: Deliver and persist delivery records
+                    logs = await self.delivery.deliver_alert(alert)
+                    for log in logs:
+                        try:
+                            self.alert_repo.save_delivery(log)
+                        except Exception as e:
+                            logger.error("delivery_log_persist_error", error=str(e))
+                    summary["alerts_delivered"] += sum(
+                        1 for l in logs if l.get("status") == "delivered"
+                    )
+                else:
+                    self._handle_rejection(scored, token, narrative)
+
+        summary["suppressed"] = suppressed_count
+        summary["token_competition_outcomes"] = token_competition_outcomes
+
+        # Step 8: Expire stale alerts and retire old ones
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
             expired = self.alert_engine.check_expired_alerts()
             for exp_alert in expired:
                 logger.info(
@@ -257,10 +1007,51 @@ class Pipeline:
                     alert_id=exp_alert.get("alert_id"),
                     type=exp_alert.get("alert_type"),
                 )
+            summary["alerts_expired"] = len(expired)
+
+            # Purge alerts older than retention window
+            if self.settings is not None:
+                retention_hours = self.settings.retired_alert_retention_hours
+            else:
+                retention_hours = 168  # 7 days default
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+            purged_alerts = self.alert_repo.purge_old_retired(cutoff.isoformat())
+            if purged_alerts:
+                logger.info("old_alerts_purged", count=purged_alerts)
 
         except Exception as e:
-            logger.error("pipeline_cycle_error", error=str(e), cycle=self._cycle_count)
-            summary["errors"].append(str(e))
+            logger.error("pipeline_expiry_error", error=str(e))
+            summary["errors"].append(f"expiry: {e}")
+
+        # Step 9: Prune old data per retention policy (every cycle)
+        try:
+            if self.settings is not None:
+                snap_hours = self.settings.chain_snapshot_retention_hours
+                score_hours = self.settings.scored_token_retention_hours
+            else:
+                snap_hours = 48
+                score_hours = 72
+
+            snap_cutoff = datetime.now(timezone.utc) - timedelta(hours=snap_hours)
+            score_cutoff = datetime.now(timezone.utc) - timedelta(hours=score_hours)
+
+            pruned_snaps = self.token_repo.prune_old_snapshots(snap_cutoff.isoformat())
+            pruned_scores = self.scoring_repo.prune_old_scored_tokens(score_cutoff.isoformat())
+
+            # Prune rejected candidates older than 48h (they are diagnostic data,
+            # not calibration data; compound PK keeps one row per pair anyway).
+            rejected_cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+            pruned_rejected = self.rejected_repo.prune_old(rejected_cutoff.isoformat())
+
+            total_pruned = pruned_snaps + pruned_scores + pruned_rejected
+            if total_pruned:
+                logger.info("data_pruned",
+                            snapshots=pruned_snaps, scored_tokens=pruned_scores,
+                            rejected_candidates=pruned_rejected)
+            summary["rows_pruned"] = total_pruned
+        except Exception as e:
+            logger.error("pipeline_pruning_error", error=str(e))
+            summary["errors"].append(f"pruning: {e}")
 
         elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
         summary["elapsed_seconds"] = round(elapsed, 2)
@@ -270,6 +1061,7 @@ class Pipeline:
 
     def get_stats(self) -> dict:
         """Return pipeline statistics."""
+        db_size_mb = round(self.db.get_size_bytes() / (1024 * 1024), 2)
         return {
             "cycles_completed": self._cycle_count,
             "total_tokens_processed": self._total_tokens_processed,
@@ -277,9 +1069,105 @@ class Pipeline:
             "source_health": self.ingestion.get_source_health(),
             "active_alerts": len(self.alert_repo.get_active()),
             "open_source_gaps": len(self.gap_repo.get_open_gaps()),
+            "db_size_mb": db_size_mb,
         }
 
     # --- Data building helpers ---
+
+    def _handle_rejection(
+        self,
+        scored: dict,
+        token: dict,
+        narrative: dict,
+        extra_reasons: list[dict] | None = None,
+    ) -> None:
+        """Log and persist a structured rejection record for a token classified as ignore.
+
+        Called when a token is suppressed by competition, narrative gating,
+        or alert classification.  Produces a per-tier breakdown of which
+        thresholds were not met so the operator can tune thresholds.
+
+        Parameters
+        ----------
+        extra_reasons
+            Additional structured suppression reasons (e.g., from competition
+            layer or narrative gating) to merge into the rejection record.
+        """
+        net_potential = scored.get("net_potential", 0.0) or 0.0
+        p_potential = scored.get("p_potential", 0.0) or 0.0
+        p_failure = scored.get("p_failure", 0.0) or 0.0
+        confidence = scored.get("confidence_score", 0.0) or 0.0
+        risk_flags = scored.get("risk_flags") or []
+        data_gaps = scored.get("data_gaps") or []
+        narrative_state = narrative.get("state", "WEAK")
+        watch_min = self.alert_engine.thresholds.watch_min_net_potential
+
+        reasons = explain_rejection(
+            net_potential=net_potential,
+            p_potential=p_potential,
+            p_failure=p_failure,
+            confidence=confidence,
+            risk_flags=risk_flags,
+            narrative_state=narrative_state,
+            data_gaps=data_gaps,
+            thresholds=self.alert_engine.thresholds,
+        )
+
+        # Merge suppression reasons from competition/gating layer
+        if extra_reasons:
+            reasons.extend(extra_reasons)
+
+        watch_gap = round(watch_min - net_potential, 4)
+
+        # Structured log — one line per rejected token, visible in pipeline output
+        logger.info(
+            "token_rejected_no_alert",
+            token_id=token.get("token_id"),
+            token_name=token.get("name"),
+            token_symbol=token.get("symbol"),
+            narrative_id=narrative.get("narrative_id"),
+            narrative_name=narrative.get("description", narrative.get("name")),
+            narrative_state=narrative_state,
+            net_potential=net_potential,
+            p_potential=p_potential,
+            p_failure=p_failure,
+            confidence=confidence,
+            watch_gap=watch_gap,
+            rejection_reasons=[r["code"] for r in reasons],
+            data_gaps=data_gaps,
+        )
+
+        # Persist to rejected_candidates table for dashboard display
+        try:
+            candidate = {
+                "token_id": token["token_id"],
+                "narrative_id": narrative["narrative_id"],
+                "token_name": token.get("name"),
+                "token_symbol": token.get("symbol"),
+                "narrative_name": narrative.get("description", narrative.get("name")),
+                "score_id": scored.get("score_id"),
+                "alert_type": "ignore",
+                "net_potential": net_potential,
+                "p_potential": p_potential,
+                "p_failure": p_failure,
+                "confidence_score": confidence,
+                "watch_gap": watch_gap,
+                "rejection_reasons": reasons,
+                "dimension_scores": {
+                    "narrative_relevance": scored.get("narrative_relevance"),
+                    "og_score": scored.get("og_score"),
+                    "rug_risk": scored.get("rug_risk"),
+                    "momentum_quality": scored.get("momentum_quality"),
+                    "attention_strength": scored.get("attention_strength"),
+                    "timing_quality": scored.get("timing_quality"),
+                },
+                "risk_flags": risk_flags,
+                "data_gaps": data_gaps,
+                "rejected_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.rejected_repo.save(candidate)
+        except Exception as e:
+            logger.error("rejected_candidate_persist_error", error=str(e))
 
     def _find_matching_narrative(self, anchor_terms: list[str]) -> dict | None:
         """Find an existing narrative that shares anchor terms."""
@@ -319,10 +1207,11 @@ class Pipeline:
 
     def _build_narrative_data(self, narrative: dict, link: dict) -> dict:
         """Build narrative_data dict for the scorer."""
+        import json as _json
+
         first_detected = narrative.get("first_detected", "")
         now = datetime.now(timezone.utc)
 
-        # Calculate narrative age in hours
         age_hours = 0.0
         if first_detected:
             try:
@@ -333,13 +1222,33 @@ class Pipeline:
             except (ValueError, TypeError):
                 pass
 
+        # Real source count: how many distinct source events contributed to this
+        # narrative (not just how many source *types*).  Varies per narrative so
+        # confidence reflects actual evidence depth.
+        sources = narrative.get("sources") or []
+        if isinstance(sources, str):
+            try:
+                sources = _json.loads(sources)
+            except Exception:
+                sources = []
+        source_count = max(1, len(sources)) if isinstance(sources, list) else 1
+
+        # Ambiguity is the inverse of match confidence: a fuzzy name match is
+        # more ambiguous than an exact one.  This makes confidence vary per link.
+        match_confidence = link.get("match_confidence", 0.5)
+        ambiguity_score = round(max(0.0, 1.0 - match_confidence), 4)
+
         return {
-            "match_confidence": link.get("match_confidence", 0.5),
+            "match_confidence": match_confidence,
             "narrative_age_hours": age_hours,
+            "source_count": source_count,            # actual event count, not type count
             "source_type_count": narrative.get("source_type_count", 1),
-            "state": narrative.get("state", "EMERGING"),
+            "ambiguity_score": ambiguity_score,      # derived from match quality
+            "state": narrative.get("state", "WEAK"),
             "attention_score": narrative.get("attention_score", 0.5),
             "narrative_velocity": narrative.get("narrative_velocity", 0.0),
+            "narrative_strength": narrative.get("narrative_strength"),
+            "velocity_state": narrative.get("velocity_state"),
         }
 
     def _build_link_data(self, link: dict) -> dict:
@@ -347,6 +1256,32 @@ class Pipeline:
         return {
             "og_rank": link.get("og_rank"),
             "og_score": link.get("og_score"),
-            "cross_source_mentions": 0,  # Would come from cross-source analysis
+            "cross_source_mentions": 0,
             "match_method": link.get("match_method", "exact"),
         }
+
+    def _get_narrative_tier(self, narrative: dict) -> str:
+        """Look up the signal tier for a narrative from the discovery engine.
+
+        Checks the live board first (already computed per cycle), then falls
+        back to computing from the candidate directly.  Returns "T3" as
+        default if no candidate is found (conservative — token-echo tier).
+        """
+        narr_name = narrative.get("description") or narrative.get("name") or ""
+
+        # Try board lookup first (computed this cycle)
+        board = getattr(self, "_current_board", None) or []
+        for entry in board:
+            if entry.get("term", "").upper() == narr_name.upper():
+                return entry.get("tier", TIER_3)
+
+        # Fall back: look up the candidate from the discovery engine
+        from mctrend.narrative.entity_extraction import canonicalize
+        canon = canonicalize(narr_name)
+        if canon and canon in self._narrative_discovery._candidates:
+            candidate = self._narrative_discovery._candidates[canon]
+            evidence = evidence_from_candidate(candidate)
+            tier, _, _ = classify_tier(evidence)
+            return tier
+
+        return TIER_3  # conservative default for unknown narratives

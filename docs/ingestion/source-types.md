@@ -184,6 +184,24 @@ This document defines the taxonomy of data source categories, their trust profil
 
 **Special handling:** Social data is never used as the sole basis for any score above `watch` tier. It must be corroborated by at least one other source category.
 
+### X (Twitter) — Implemented
+
+X is an emergent narrative detection layer. It discovers trending
+entities/topics from broad source material, detects spikes, and
+correlates them with token launches. See `docs/ingestion/x-twitter-integration.md`
+and `docs/ingestion/x-emergent-narrative-detection.md` for full design.
+
+- **Adapter:** `XAPIAdapter` in `src/mctrend/ingestion/adapters/x_api.py`
+- **Mode:** Polling via X API v2 Recent Search with rotating broad discovery queries
+- **Entity extraction:** `XEntityExtractor` in `src/mctrend/narrative/entity_extraction.py`
+- **Spike detection:** `XEntityTracker` in `src/mctrend/narrative/entity_tracker.py`
+- **Correlation:** `spike_correlator` in `src/mctrend/narrative/spike_correlator.py`
+- **Source type:** `social_media`
+- **Source name:** `@<author_handle>` (per-tweet), `x_spike_detection` (spike events)
+- **Signal extraction:** Deterministic (no LLM) — entity extraction, spike detection, token matching
+- **Rate limiting:** Credit-based budget with exponential-backoff cooldown, state persisted across restarts
+- **Degraded mode:** Pipeline continues without X; `x_source_available: false` in cycle summary
+
 ---
 
 ## Source Category: Community Channels

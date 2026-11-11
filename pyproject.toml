@@ -15,6 +15,11 @@ dependencies = [
     "httpx>=0.25",
     "structlog>=23.0",
     "python-dotenv>=1.0",
+    # Dashboard / operator API
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "python-multipart>=0.0.6",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]
