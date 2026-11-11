@@ -5,7 +5,9 @@ Usage:
     python -m mctrend.runner              # Run continuous polling loop
     python -m mctrend.runner --once       # Run single cycle and exit
     python -m mctrend.runner --status     # Show system status and exit
-    python -m mctrend.runner --demo       # Run with synthetic demo data
+    python -m mctrend.runner --demo       # One cycle on synthetic demo data
+    python -m mctrend.runner --dashboard  # Continuous loop plus the dashboard
+    python -m mctrend.runner --demo --dashboard   # Dashboard on demo data, no keys
 """
 
 import argparse
@@ -655,11 +657,19 @@ async def run_once(settings: Settings, demo: bool = False):
     db.close()
 
 
-async def run_continuous(settings: Settings, dashboard: bool = False):
-    """Run continuous polling loop with graceful shutdown on SIGINT/SIGTERM."""
+async def run_continuous(
+    settings: Settings, dashboard: bool = False, demo: bool = False
+):
+    """Run continuous polling loop with graceful shutdown on SIGINT/SIGTERM.
+
+    When *demo* is True, no live adapters are registered: the synthetic data
+    from ``inject_demo_data`` is injected once and the loop keeps running on
+    it.  This is what ``--demo --dashboard`` uses, so the dashboard can be
+    opened without any API key.
+    """
     from mctrend.api import deps as api_deps
 
-    pipeline, db, ws_adapter = build_system(settings)
+    pipeline, db, ws_adapter = build_system(settings, demo_mode=demo)
 
     # Register DB and WS adapter with the API layer
     api_deps.set_db(db)
@@ -667,8 +677,11 @@ async def run_continuous(settings: Settings, dashboard: bool = False):
     if ws_adapter is not None:
         api_deps.set_ws_adapter(ws_adapter)
 
-    # Run source auth preflight checks before first cycle
-    await _run_startup_preflight(pipeline.ingestion)
+    if demo:
+        inject_demo_data(pipeline)
+    else:
+        # Run source auth preflight checks before first cycle
+        await _run_startup_preflight(pipeline.ingestion)
 
     # Start WebSocket adapter background task
     if ws_adapter is not None:
@@ -793,7 +806,10 @@ async def show_status(settings: Settings):
             print(f"  Tokens ({status}): {count}")
 
     # Active narratives
-    for state in ["EMERGING", "PEAKING", "DECLINING", "DEAD"]:
+    for state in [
+        "WEAK", "EMERGING", "RISING", "TRENDING", "FADING", "DEAD",
+        "PEAKING", "DECLINING",  # legacy names, still possible in an old database
+    ]:
         narratives = narrative_repo.get_active(states=[state])
         if narratives:
             print(f"  Narratives ({state}): {len(narratives)}")
@@ -854,10 +870,13 @@ def main():
     try:
         if args.status:
             asyncio.run(show_status(settings))
-        elif args.once or args.demo:
+        elif args.once or (args.demo and not args.dashboard):
+            # --demo alone is one cycle; --demo --dashboard keeps serving it.
             asyncio.run(run_once(settings, demo=args.demo))
         else:
-            asyncio.run(run_continuous(settings, dashboard=args.dashboard))
+            asyncio.run(
+                run_continuous(settings, dashboard=args.dashboard, demo=args.demo)
+            )
     except SchemaVersionError as e:
         print(f"\n[SCHEMA VERSION ERROR] {e}", file=sys.stderr)
         print(

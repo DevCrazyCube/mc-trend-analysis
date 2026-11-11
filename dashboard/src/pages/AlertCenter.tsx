@@ -52,8 +52,11 @@ function dominantBadge(type: string) {
   return <Badge variant={alertTypeBadgeVariant(type)}>{type.replace(/_/g, ' ')}</Badge>
 }
 
-function statusBadge(s: string) {
-  return <Badge variant={s === 'active' ? 'green' : 'gray'}>{s}</Badge>
+// A single alert carries the stored status (ACTIVE / RETIRED / EXPIRED); a
+// narrative group carries active / retired. Compare and show without case.
+function statusBadge(s?: string | null) {
+  const status = (s || '').toLowerCase()
+  return <Badge variant={status === 'active' ? 'green' : 'gray'}>{status}</Badge>
 }
 
 // Find the best matching board entry for a narrative group.
@@ -192,9 +195,7 @@ function NarrativeGroupDetail({
                   <span style={{ fontSize: 12, color: '#c9d1d9', flex: 1 }}>
                     {a.token_name || shortAddr(a.token_address)}
                   </span>
-                  <Badge variant={a.status === 'active' ? 'green' : 'gray'}>
-                    {a.status}
-                  </Badge>
+                  {statusBadge(a.status)}
                 </div>
                 <div
                   style={{

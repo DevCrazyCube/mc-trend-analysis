@@ -23,6 +23,24 @@ from mctrend.persistence.repositories import (
 
 router = APIRouter(prefix="/api/health", tags=["health"])
 
+# The narrative lifecycle, in order. These are always reported, also at zero.
+NARRATIVE_LIFECYCLE_STATES = ["WEAK", "EMERGING", "RISING", "TRENDING", "FADING", "DEAD"]
+# States written by older versions. Reported only when a row still has one.
+LEGACY_NARRATIVE_STATES = ["PEAKING", "DECLINING"]
+
+
+def count_narratives_by_state(narrative_repo: NarrativeRepository) -> dict[str, int]:
+    """Count narratives per lifecycle state for the health view."""
+    counts = {
+        state: len(narrative_repo.get_active(states=[state]))
+        for state in NARRATIVE_LIFECYCLE_STATES
+    }
+    for state in LEGACY_NARRATIVE_STATES:
+        legacy = len(narrative_repo.get_active(states=[state]))
+        if legacy:
+            counts[state] = legacy
+    return counts
+
 
 @router.get("")
 async def get_health(
@@ -42,10 +60,7 @@ async def get_health(
         token_counts[status] = len(rows)
 
     # Narrative counts
-    narrative_counts = {}
-    for state in ["EMERGING", "PEAKING", "DECLINING", "DEAD"]:
-        rows = narrative_repo.get_active(states=[state])
-        narrative_counts[state] = len(rows)
+    narrative_counts = count_narratives_by_state(narrative_repo)
 
     # Alerts
     active_alerts = alert_repo.get_active()

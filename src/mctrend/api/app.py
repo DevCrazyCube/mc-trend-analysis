@@ -23,6 +23,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from mctrend.api.auth import auth_is_configured
 from mctrend.api.routes import (
@@ -41,6 +42,34 @@ from mctrend.api.routes import (
 logger = structlog.get_logger(__name__)
 
 _STATIC_DIR = Path(__file__).parent.parent.parent.parent / "dashboard" / "dist"
+
+
+class DashboardFiles(StaticFiles):
+    """The built dashboard, with a fallback for its client-side routes.
+
+    The dashboard is a single-page app: ``/alerts`` or ``/tokens`` are routes
+    inside ``index.html``, not files.  Without a fallback a reload on such a
+    page, or a link to it, is a 404.  A path that is not a file, is not under
+    ``/api`` and has no file extension gets ``index.html``; a missing asset
+    (``/assets/x.js``) and an unknown API path stay a 404.
+    """
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404 or not _is_client_route(path):
+                raise
+            return await super().get_response("index.html", scope)
+
+
+def _is_client_route(path: str) -> bool:
+    """True for a path the dashboard's own router should handle."""
+    path = path.replace("\\", "/").strip("/")
+    if path == "api" or path.startswith("api/"):
+        return False
+    last = path.rsplit("/", 1)[-1]
+    return "." not in last
 
 
 def create_app() -> FastAPI:
@@ -82,7 +111,7 @@ def create_app() -> FastAPI:
 
     # Serve built dashboard if it exists
     if _STATIC_DIR.exists():
-        app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="dashboard")
+        app.mount("/", DashboardFiles(directory=str(_STATIC_DIR), html=True), name="dashboard")
         logger.info("dashboard_static_served", path=str(_STATIC_DIR))
     else:
         logger.info(

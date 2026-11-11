@@ -46,11 +46,22 @@ ALERT_TIERS: dict[str, int] = {
 # The set of "high tier" prior alert types that qualify a token for take_profit_watch.
 _HIGH_TIER_TYPES = {"possible_entry", "high_potential_watch"}
 
-# Narrative states considered active enough for the top alert tiers.
-_ACTIVE_NARRATIVE_STATES = {"EMERGING", "PEAKING"}
+# The narrative lifecycle is WEAK -> EMERGING -> RISING -> TRENDING -> FADING -> DEAD
+# (mctrend.narrative.intelligence), and the pipeline only passes a token on to the
+# alert engine when its narrative is RISING or TRENDING.  PEAKING and DECLINING are
+# the names the lifecycle used before; they stay here so rows and callers written
+# with them keep their meaning (PEAKING = TRENDING, DECLINING = FADING).
 
-# Narrative states valid for take_profit_watch.
-_TAKE_PROFIT_NARRATIVE_STATES = {"PEAKING", "DECLINING"}
+# Narrative states considered active enough for the top alert tiers.
+_ACTIVE_NARRATIVE_STATES = {"EMERGING", "RISING", "TRENDING", "PEAKING"}
+
+# Narrative states valid for take_profit_watch: at the peak or just past it.
+_TAKE_PROFIT_NARRATIVE_STATES = {"TRENDING", "FADING", "PEAKING", "DECLINING"}
+
+
+def _state(narrative_state: str | None) -> str:
+    """The narrative state as the gates compare it: upper-case, never None."""
+    return (narrative_state or "").upper()
 
 
 def explain_rejection(
@@ -80,6 +91,7 @@ def explain_rejection(
     """
     if thresholds is None:
         thresholds = AlertThresholds()
+    narrative_state = _state(narrative_state)
 
     reasons: list[dict] = []
 
@@ -236,9 +248,11 @@ def classify_alert(
     2. Check discard thresholds -> discard
     3. Check exit_risk (only if has_prior_alert and p_failure >= threshold) -> exit_risk
     4. Check blocking flags -> cap at verify
-    5. Check possible_entry thresholds + narrative must be EMERGING or PEAKING -> possible_entry
+    5. Check possible_entry thresholds + narrative must be active
+       (EMERGING, RISING or TRENDING) -> possible_entry
     6. Check high_potential_watch -> high_potential_watch
-    7. Check take_profit_watch (only if prior alert was high tier and narrative PEAKING/DECLINING) -> take_profit_watch
+    7. Check take_profit_watch (only if prior alert was high tier and narrative
+       TRENDING or FADING) -> take_profit_watch
     8. Check verify (net_potential >= threshold but confidence < verify_max) -> verify
     9. Check watch -> watch
     10. Otherwise -> ignore
@@ -250,6 +264,7 @@ def classify_alert(
     """
     if thresholds is None:
         thresholds = AlertThresholds()
+    narrative_state = _state(narrative_state)
 
     # ------------------------------------------------------------------
     # 1. Discard flags — immediate discard
@@ -285,7 +300,7 @@ def classify_alert(
     # ------------------------------------------------------------------
     # 5. Possible entry — strict criteria
     #    Docs: net_potential >= 0.60, P_failure < 0.30, confidence >= 0.65,
-    #          narrative EMERGING or PEAKING, no critical risk flags
+    #          narrative EMERGING, RISING or TRENDING, no critical risk flags
     #    Conservative tie-breaking:
     #      net_potential on boundary 0.60 -> meets (docs say >=)
     #      p_failure on boundary 0.30 -> does NOT meet (docs say <, boundary fails)
@@ -303,7 +318,7 @@ def classify_alert(
     # ------------------------------------------------------------------
     # 6. High potential watch
     #    Docs: net_potential >= 0.45, P_failure < 0.50, confidence >= 0.55,
-    #          narrative EMERGING or PEAKING
+    #          narrative EMERGING, RISING or TRENDING
     #    Conservative:
     #      net_potential on boundary 0.45 -> meets (>=)
     #      p_failure on boundary 0.50 -> does NOT meet (<, boundary fails)
@@ -321,7 +336,7 @@ def classify_alert(
     # ------------------------------------------------------------------
     # 7. Take profit watch — only for tokens with prior high-tier alerts
     #    Docs: prior alert was possible_entry or high_potential_watch,
-    #          net_potential still >= 0.35, narrative PEAKING or early DECLINING
+    #          net_potential still >= 0.35, narrative TRENDING or early FADING
     # ------------------------------------------------------------------
     if (
         has_prior_alert

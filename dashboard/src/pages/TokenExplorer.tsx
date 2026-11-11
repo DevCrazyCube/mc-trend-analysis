@@ -235,7 +235,10 @@ function TokenDetail({ detail }: { detail: any }) {
             <div key={i} style={{ padding: '6px 0', borderBottom: '1px solid #21262d', fontSize: 12, display: 'flex', gap: 10 }}>
               <Badge variant={alertTypeBadge(a.alert_type)}>{a.alert_type}</Badge>
               <span style={{ color: '#6e7681' }}>net: {fmtPct(a.net_potential)}</span>
-              <span style={{ color: a.status === 'active' ? '#3fb950' : '#6e7681' }}>{a.status}</span>
+              {/* Alerts are stored as ACTIVE / RETIRED / EXPIRED: compare without case. */}
+              <span style={{ color: (a.status || '').toLowerCase() === 'active' ? '#3fb950' : '#6e7681' }}>
+                {(a.status || '').toLowerCase()}
+              </span>
             </div>
           ))}
         </Card>

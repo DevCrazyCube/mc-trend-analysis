@@ -10,6 +10,26 @@ from mctrend.persistence.repositories import AlertRepository, TokenRepository
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
+# Alerts are stored with an upper-case status (ACTIVE, RETIRED, EXPIRED); the
+# query parameter and the group status are lower-case.  An alert that is no
+# longer active, retired or expired, counts as "retired" for the filter.
+_ACTIVE_SQL = "UPPER(status) = 'ACTIVE'"
+_RETIRED_SQL = "UPPER(status) IN ('RETIRED', 'EXPIRED')"
+
+
+def _status_filter(status: str | None) -> str | None:
+    """Return the SQL condition for a ``status`` query value, or None for all."""
+    wanted = (status or "").strip().lower()
+    if wanted == "active":
+        return _ACTIVE_SQL
+    if wanted == "retired":
+        return _RETIRED_SQL
+    return None
+
+
+def _is_active(alert: dict) -> bool:
+    return str(alert.get("status") or "").upper() == "ACTIVE"
+
 
 def _safe_json(val):
     if val is None:
@@ -40,25 +60,14 @@ async def list_alerts(
     db=Depends(get_db),
 ):
     """List alerts with optional filters."""
-    alert_repo = AlertRepository(db)
-
-    if status == "active":
-        alerts = alert_repo.get_active()
-    elif status == "retired":
-        cursor = db.connection.cursor()
-        rows = cursor.execute(
-            "SELECT * FROM alerts WHERE status = 'retired' "
-            "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        ).fetchall()
-        alerts = [dict(r) for r in rows]
-    else:
-        cursor = db.connection.cursor()
-        rows = cursor.execute(
-            "SELECT * FROM alerts ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        ).fetchall()
-        alerts = [dict(r) for r in rows]
+    condition = _status_filter(status)
+    where = f"WHERE {condition} " if condition else ""
+    cursor = db.connection.cursor()
+    rows = cursor.execute(
+        f"SELECT * FROM alerts {where}ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    alerts = [dict(r) for r in rows]
 
     if alert_type:
         alerts = [a for a in alerts if a.get("alert_type") == alert_type]
@@ -92,23 +101,12 @@ async def list_alerts_by_narrative(
     """
     cursor = db.connection.cursor()
 
-    if status == "active":
-        rows = cursor.execute(
-            "SELECT * FROM alerts WHERE status = 'active' "
-            "ORDER BY updated_at DESC LIMIT ?",
-            (limit * 20,),
-        ).fetchall()
-    elif status == "retired":
-        rows = cursor.execute(
-            "SELECT * FROM alerts WHERE status = 'retired' "
-            "ORDER BY updated_at DESC LIMIT ?",
-            (limit * 20,),
-        ).fetchall()
-    else:
-        rows = cursor.execute(
-            "SELECT * FROM alerts ORDER BY updated_at DESC LIMIT ?",
-            (limit * 20,),
-        ).fetchall()
+    condition = _status_filter(status)
+    where = f"WHERE {condition} " if condition else ""
+    rows = cursor.execute(
+        f"SELECT * FROM alerts {where}ORDER BY updated_at DESC LIMIT ?",
+        (limit * 20,),
+    ).fetchall()
 
     alerts = [_enrich_alert(dict(r)) for r in rows]
 
@@ -153,7 +151,7 @@ async def list_alerts_by_narrative(
         atype = a.get("alert_type") or "unknown"
         g["_type_counts"][atype] = g["_type_counts"].get(atype, 0) + 1
 
-        if a.get("status") == "active":
+        if _is_active(a):
             g["has_active"] = True
 
         g["alerts"].append(a)
